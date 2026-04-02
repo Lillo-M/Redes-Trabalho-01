@@ -254,6 +254,29 @@ public:
     data.data[checksum.size()] = 0;
     sendto(serverSocket, &data, sizeof(data), 0, (sockaddr *)&clientAddress,
            sizeof(clientAddress));
+
+    nackedBuffer.push_back(data);
+    nackedPacketsCount++;
+
+    while (nackedPacketsCount > 0) {
+      struct TransfereeHeader header;
+
+      socklen_t clientLen = sizeof(clientAddress);
+      ssize_t bytesReceived = recvfrom(serverSocket, &header, sizeof(header), 0,
+                                       (sockaddr *)&clientAddress, &clientLen);
+
+      if (header.flags == TransferFlags::ACK) {
+
+        for (int i = 0; i < nackedBuffer.size(); i++) {
+
+          if (nackedBuffer[i].sequence == header.sequence) {
+            nackedBuffer.erase(nackedBuffer.begin() + i);
+            nackedPacketsCount--;
+            break;
+          }
+        }
+      }
+    }
   }
 };
 int main() {

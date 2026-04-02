@@ -1,5 +1,3 @@
-// Client side implementation of UDP client-server model
-
 #include <arpa/inet.h>
 #include <bits/stdc++.h>
 #include <netinet/in.h>
@@ -9,6 +7,60 @@
 #include <unistd.h>
 
 using namespace std;
+
+#include <fstream>
+#include <string>
+
+class FileWriter {
+private:
+  ofstream file;
+
+public:
+  bool openFile(const string &filename) {
+    file.open(filename, ios::binary);
+
+    return file.is_open();
+  }
+
+  bool writeBuffer(const unsigned char *buffer, size_t size) {
+    if (!file.is_open())
+      return false;
+
+    file.write(reinterpret_cast<const char *>(buffer), size);
+
+    return file.good();
+  }
+
+  void closeFile() {
+    if (file.is_open())
+      file.close();
+  }
+};
+
+bool compareFileSha256(const string &filename, const string &expectedHash) {
+  string command = "sha256sum \"" + filename + "\"";
+
+  array<char, 128> buffer;
+  string output;
+
+  FILE *pipe = popen(command.c_str(), "r");
+  if (!pipe)
+    return false;
+
+  while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+    output += buffer.data();
+  }
+
+  pclose(pipe);
+
+  size_t firstSpace = output.find(' ');
+  if (firstSpace == string::npos)
+    return false;
+
+  string fileHash = output.substr(0, firstSpace);
+
+  return fileHash == expectedHash;
+}
 
 #define PORT 8080
 #define MAXLINE 1024
@@ -32,10 +84,10 @@ struct TransfereeHeader {
 };
 
 int main() {
-  std::string ipv4 = "";
+  string ipv4 = "";
   cout << "Server address: ";
   getline(cin, ipv4);
-  std::regex pattern("^(((?!25?[6-9])[12]\\d|[1-9])?\\d\\.?\\b){4}$");
+  regex pattern("^(((?!25?[6-9])[12]\\d|[1-9])?\\d\\.?\\b){4}$");
 
   if (!regex_search(ipv4, pattern) && !ipv4.empty())
     return -1;
@@ -83,6 +135,10 @@ int main() {
   struct TransfereeHeader ack;
 
   int sequence = 0;
+
+  FileWriter fileWriter;
+  fileWriter.openFile(request);
+
   // Receive reply from server
   while (true) {
     int n = recvfrom(sockfd, &buffer, sizeof(buffer), MSG_WAITALL,
@@ -94,6 +150,10 @@ int main() {
       ack.flags = TransferFlags::ACK;
 
       if (buffer.sequence >= sequence) {
+        if (buffer.sequence == sequence) {
+          fileWriter.writeBuffer(buffer.data, buffer.dataSize);
+        }
+
         sendto(sockfd, &ack, sizeof(ack), MSG_CONFIRM,
                (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
 
@@ -105,8 +165,13 @@ int main() {
       }
 
     } else if (buffer.flags == TransferFlags::END) {
-      cout << "Server: Transmition ended checksum -> " << buffer.data
-           << std::endl;
+      cout << "Server: Transmition ended checksum"
+           << (compareFileSha256(request, string((char *)buffer.data))
+                   ? "Success"
+                   : "Failed")
+           << " -> " << buffer.data << endl;
+      fileWriter.closeFile();
+      ;
       break;
     }
   }
