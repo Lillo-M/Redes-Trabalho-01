@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <poll.h>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -17,8 +18,9 @@ using namespace std;
 
 #define PORT 8080
 #define FAIL -1
+#define TIMEOUT_MS 13
 
-#define WINDOW_SIZE 5
+#define WINDOW_SIZE 100
 
 enum TransferFlags {
   ACK = 0,
@@ -41,6 +43,7 @@ struct TransfereeHeader {
 class Server {
 
 public:
+  pollfd pfd;
   sockaddr_in serverAddress;
   int serverSocket;
   sockaddr_in clientAddress;
@@ -50,7 +53,7 @@ public:
   int nackedPacketsCount;
   string ipv4;
 
-  Server() : ipv4(""), file(), buffer(1024), nackedBuffer(1024) {
+  Server() : ipv4(""), file(), buffer(1024), nackedBuffer(1024), nackedPacketsCount(0){
     cout << "Server address: ";
     getline(cin, ipv4);
     regex pattern("^(((?!25?[6-9])[12]\\d|[1-9])?\\d\\.?\\b){4}$");
@@ -84,6 +87,9 @@ public:
       cout << "failed to bind\n";
       exit(-1);
     }
+
+    pfd.fd = serverSocket;
+    pfd.events = POLLIN;
 
     char buff[1024];
     socklen_t clientLen = sizeof(clientAddress);
@@ -207,28 +213,46 @@ public:
 
     while (!file.eof()) {
 
-      if (nackedPacketsCount >= WINDOW_SIZE) {
-        cout << "window is full\n";
         int temp = nackedPacketsCount;
-        do {
-          struct TransfereeHeader header;
+        struct TransfereeHeader header;
+        ssize_t bytesReceived;
+        socklen_t clientLen = sizeof(clientAddress);
 
-          socklen_t clientLen = sizeof(clientAddress);
-          ssize_t bytesReceived =
+        int ret = poll(&pfd, 1, TIMEOUT_MS);
+
+        while (ret > 0) {
+          bytesReceived =
               recvfrom(serverSocket, &header, sizeof(header), 0,
                        (sockaddr *)&clientAddress, &clientLen);
+
           if (header.flags == TransferFlags::ACK) {
 
+		  bool erased = false;
             for (int i = 0; i < nackedBuffer.size(); i++) {
 
               if (nackedBuffer[i].sequence == header.sequence) {
                 nackedBuffer.erase(nackedBuffer.begin() + i);
                 nackedPacketsCount--;
+		erased = true;
                 break;
               }
             }
+	    if (!erased && header.sequence == nackedBuffer[0].sequence - 1) {
+              for (auto& nacked: nackedBuffer){
+	        sendto(serverSocket, &nacked, sizeof(nacked), 0, (sockaddr *)&clientAddress,
+		     sizeof(clientAddress));
+	      }
+	    }
           }
-        } while (nackedPacketsCount > temp - WINDOW_SIZE);
+          ret = poll(&pfd, 1, TIMEOUT_MS);
+        } 
+      if (nackedPacketsCount >= WINDOW_SIZE) {
+        cout << "window is full\n";
+	for (auto& nacked: nackedBuffer){
+		sendto(serverSocket, &nacked, sizeof(nacked), 0, (sockaddr *)&clientAddress,
+				sizeof(clientAddress));
+	}
+	continue;
       }
 
       if (readFileChunk(data) == FAIL) {
