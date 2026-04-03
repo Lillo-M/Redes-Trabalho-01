@@ -165,12 +165,12 @@ int main() {
       }
 
     } else if (buffer.flags == TransferFlags::END) {
+      fileWriter.closeFile();
       cout << "Server: Transmition ended checksum"
            << (compareFileSha256(request, string((char *)buffer.data))
                    ? "Success"
                    : "Failed")
            << " -> " << buffer.data << endl;
-      fileWriter.closeFile();
       ;
       break;
     }
