@@ -1,73 +1,85 @@
 #include <arpa/inet.h>
-#include <poll.h>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <netinet/in.h>
+#include <poll.h>
 #include <regex>
 #include <string>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+using std::this_thread::sleep_for;
 
 using namespace std;
 
 #define PORT 8080
 #define FAIL -1
 #define TIMEOUT_MS 13
+#define POLL_REQUESTS_TIMEOUT 5000
+#define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
+#define PAYLOAD_SIZE 1024
 
 #define WINDOW_SIZE 100
 
 enum TransferFlags {
-  ACK = 0,
-  DATA = 1,
-  END = 2,
+  ACK = (1 << 0),
+  DATA = (1 << 1),
+  FIN = (1 << 2),
+  SYN = (1 << 3),
 };
 
-struct TransfererHeader {
+typedef struct TransfererHeader {
   uint32_t sequence;
+  uint32_t ackNumber;
   uint16_t dataSize;
+  uint16_t rwnd;
   uint8_t flags;
-  unsigned char data[1024];
-};
+  char data[PAYLOAD_SIZE];
+} TransfererHeader;
 
-struct TransfereeHeader {
-  uint32_t sequence;
-  uint8_t flags;
-};
+typedef struct PacketTimer {
+  clock_t estimatedTimeout = INIT_ESTIMATED_TIMEOUT;
+  clock_t ackClock = 0;
+  clock_t sendClock = 0;
+  clock_t timeoutClock = 0;
+  uint32_t packetSequence = 0;
+} PacketTimer;
 
 class Server {
 
 public:
-  pollfd pfd;
-  sockaddr_in serverAddress;
-  int serverSocket;
-  sockaddr_in clientAddress;
-  ifstream file;
-  vector<unsigned char> buffer;
-  vector<TransfererHeader> nackedBuffer;
-  int nackedPacketsCount;
-  string ipv4;
+  pollfd pfd{};
+  sockaddr_in serverAddress{};
+  socklen_t clientLen = sizeof(serverAddress);
+  int serverSocket = -1;
+  sockaddr_in clientAddress{};
+  ifstream file = ifstream();
+  vector<TransfererHeader> nackedPacketsBuffer = vector<TransfererHeader>(1024);
+  int nackedPacketsCount = 0;
+  string ipv4 = "";
+  PacketTimer packetTimer;
 
-  Server() : ipv4(""), file(), buffer(1024), nackedBuffer(1024), nackedPacketsCount(0){
+  void inputIpAddress() {
     cout << "Server address: ";
     getline(cin, ipv4);
     regex pattern("^(((?!25?[6-9])[12]\\d|[1-9])?\\d\\.?\\b){4}$");
 
     if (!regex_search(ipv4, pattern) && !ipv4.empty())
       exit(-1);
+  }
 
-    // creating socket
-    serverSocket = socket(AF_INET, SOCK_DGRAM,
-                          0); // DGRAM -> manual disse que DGRAM seria
-                              // datagramas, suponho então que seja uma conexão
-                              // udp, já que as outras são 'confiaveis'
-
-    // specifying the address
+  void setupServerAddress() {
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(PORT);
 
@@ -80,39 +92,43 @@ public:
         exit(-1); // invalid IP
       }
     }
+  }
 
-    // binding socket.
+  void bindSocket() {
     if (bind(serverSocket, (struct sockaddr *)&serverAddress,
              sizeof(serverAddress)) == FAIL) {
       cout << "failed to bind\n";
       exit(-1);
     }
+  }
 
+  void setupPollDescriptor() {
     pfd.fd = serverSocket;
     pfd.events = POLLIN;
+  }
 
-    char buff[1024];
-    socklen_t clientLen = sizeof(clientAddress);
+  Server() {
+    inputIpAddress();
 
-    ssize_t bytesReceived = recvfrom(serverSocket, buff, sizeof(buff) - 1, 0,
-                                     (sockaddr *)&clientAddress, &clientLen);
+    // creating socket
+    serverSocket = socket(AF_INET, SOCK_DGRAM,
+                          0); // DGRAM -> manual disse que DGRAM seria
+                              // datagramas, suponho então que seja uma conexão
+                              // udp, já que as outras são 'confiaveis'
 
-    if (bytesReceived == -1) {
-      cout << "failed to receive\n";
-      exit(-1);
-    }
+    // specifying the address
+    setupServerAddress();
 
-    buff[bytesReceived] = '\0';
+    // binding socket.
+    bindSocket();
 
-    string request(buff);
+    setupPollDescriptor();
 
-    cout << "Message from client: " << buff << '\n';
+    string request = pollRequest();
 
-    const char *response;
+    cout << "Message from client: " << request << endl;
 
-    string temp;
-
-    handleRequest(request, response);
+    handleRequest(request);
 
     // closing the socket.
     close(serverSocket);
@@ -139,12 +155,14 @@ public:
     file.open(filename, ios::binary);
   }
 
+  void closeFile() { file.close(); }
+
   /**
    * return 1 when read more than zero bytes;
    * return 0 when read less or equal zero bytes;
    * return -1 when file is null;
    * */
-  int readFileChunk(struct TransfererHeader &data) {
+  int readFileChunk(vector<unsigned char> &buffer) {
     if (!file.is_open())
       return -1;
 
@@ -152,17 +170,20 @@ public:
 
     std::streamsize bytesRead = file.gcount();
 
-    memccpy(data.data, buffer.data(), 0, bytesRead);
+    return bytesRead;
+  }
 
-    data.dataSize = bytesRead;
+  TransfererHeader createPacket(vector<unsigned char> &data, int dataSize,
+                                uint32_t sequence, uint8_t flags) {
+    TransfererHeader packet;
+    memccpy(packet.data, data.data(), 0, dataSize);
 
-    if (bytesRead > 0) {
-      data.flags = TransferFlags::DATA;
-      return 1;
-    }
+    packet.dataSize = dataSize;
+    packet.sequence = sequence;
+    packet.ackNumber = sequence;
+    packet.flags = flags;
 
-    data.flags = TransferFlags::END;
-    return 0;
+    return packet;
   }
 
   std::string sha256File(const std::string &filename) {
@@ -187,122 +208,306 @@ public:
     return result.substr(0, space);
   }
 
-  void handleRequest(string &request, const char *&response) {
+  void handleRequest(string &request) {
+    string response;
     if (string::npos == request.find("GET")) {
       response = "Error: Bad request";
-    }
-
-    string filename = request.substr(4, request.length());
-
-    if (!fileExistsInRoot(filename)) {
-      response = "Seu GET é uma merda\n";
+      cout << response << endl;
       return;
     }
 
-    response = "Você fez um GET então\n";
+    const int indexAfterGetAndWhitespace = 4;
+
+    string filename =
+        request.substr(indexAfterGetAndWhitespace, request.length());
+
+    if (!fileExistsInRoot(filename)) {
+      response = "Seu GET é uma merda\n";
+      cout << response << endl;
+      return;
+    }
+
     string checksum = sha256File(filename);
 
-    struct TransfererHeader data;
     openFile(filename);
+
     streamFile(checksum);
+
+    closeFile();
   }
+
+  ssize_t sockReceive(TransfererHeader &header) {
+    return recvfrom(serverSocket, &header, sizeof(header), 0,
+                    (sockaddr *)&clientAddress, &clientLen);
+  }
+
+  void sendPacket(TransfererHeader &packet) {
+    sockSend(packet);
+
+    nackedPacketsBuffer.push_back(packet);
+    nackedPacketsCount++;
+  }
+
+  void handlePacketLoss(TransfererHeader &packet) {
+    if (packet.sequence == nackedPacketsBuffer[0].sequence - 1) {
+      resendAllNackedPackets();
+    }
+  }
+
+  void sendEstab(TransfererHeader &header) {
+    TransfererHeader packet{.sequence = static_cast<uint32_t>(rand() % 100),
+                            .ackNumber = header.sequence + 1,
+                            .dataSize = 0,
+                            .flags = TransferFlags::SYN,
+                            .data = ""};
+
+    sendPacket(packet);
+    initTimeout(packet.sequence);
+  }
+
+  int receiveSyn(TransfererHeader &header) {
+    ssize_t bytesReceived = sockReceive(header);
+
+    if (bytesReceived <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
+    }
+
+    if (header.flags != TransferFlags::SYN) {
+      cout << "handshake failed\n";
+      return -2;
+    }
+    return 0;
+  }
+
+  int receiveEstab(TransfererHeader &header) {
+    ssize_t bytesReceived = sockReceive(header);
+
+    if (bytesReceived <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
+    }
+
+    if (header.flags != (TransferFlags::ACK | TransferFlags::SYN) ||
+        header.ackNumber != packetTimer.packetSequence + 1) {
+      cout << "handshake failed\n";
+      return -2;
+    }
+
+    nackedPacketsBuffer.pop_back();
+    nackedPacketsCount--;
+    return 0;
+  }
+
+  int tryHandshake() {
+    TransfererHeader header;
+
+    int ret = receiveSyn(header);
+
+    if (ret < 0) {
+      return ret;
+    }
+
+    sendEstab(header);
+
+    waitForEstabOrTimeout();
+
+    return receiveEstab(header);
+  }
+
+  int waitForEstabOrTimeout() {
+    int ret = poll(&pfd, 1, TIMEOUT_MS);
+
+    int timeouts = 0;
+    while (timeouts < 3) {
+      ret = poll(&pfd, 1, TIMEOUT_MS);
+      if (ret > 0) {
+        return 0;
+      }
+      if (clock() >= packetTimer.timeoutClock) {
+        timeouts++;
+        initTimeout(packetTimer.packetSequence);
+        resendAllNackedPackets();
+      }
+    }
+    return -1;
+  }
+
+  int waitForRequestOrTimeout() {
+    int ret = poll(&pfd, 1, TIMEOUT_MS);
+
+    int timeouts = 0;
+    while (timeouts < 2) {
+      ret = poll(&pfd, 1, POLL_REQUESTS_TIMEOUT);
+      if (ret > 0) {
+        return 0;
+      }
+    }
+    return -1;
+  }
+
+  void waitForPackets() {
+    int ret = poll(&pfd, 1, POLL_REQUESTS_TIMEOUT);
+
+    while (ret <= 0) {
+      ret = poll(&pfd, 1, POLL_REQUESTS_TIMEOUT);
+    }
+  }
+
+  string pollRequest() {
+    int handshake = -2;
+    while (handshake < 0) {
+      waitForPackets();
+
+      handshake = tryHandshake();
+    }
+
+    return waitForRequest();
+  }
+
+  string waitForRequest() {
+    int ret = waitForRequestOrTimeout();
+    if (ret < 0) {
+
+      return string("");
+    }
+    TransfererHeader packet{};
+    ssize_t bytesReceived = sockReceive(packet);
+    if (bytesReceived <= 0) {
+      cout << "Failed to receive\n";
+      return string("");
+    }
+    packet.data[PAYLOAD_SIZE - 1] = 0;
+    return string(packet.data);
+  }
+
+  void pollAcks() {
+    TransfererHeader header;
+    ssize_t bytesReceived;
+
+    int ret = poll(&pfd, 1, TIMEOUT_MS);
+
+    while (ret > 0 && nackedPacketsCount > 0) {
+      bytesReceived = recvfrom(serverSocket, &header, sizeof(header), 0,
+                               (sockaddr *)&clientAddress, &clientLen);
+
+      if (bytesReceived > 0)
+        std::printf(
+            "\n================================================================"
+            "====================================\nSeq: %d, ack: %d, data: "
+            "|`%s`|\n=========================================================="
+            "==========================================\n",
+            header.sequence, header.ackNumber, header.data);
+
+      if (header.flags == TransferFlags::ACK) {
+
+        bool acked = false;
+        for (int i = 0; i < nackedPacketsBuffer.size(); i++) {
+
+          if (nackedPacketsBuffer[i].sequence == header.sequence) {
+            nackedPacketsBuffer.erase(nackedPacketsBuffer.begin(),
+                                      nackedPacketsBuffer.begin() + i);
+            nackedPacketsCount -= i + 1;
+            acked = true;
+            break;
+          }
+        }
+
+        if (!acked) {
+          handlePacketLoss(header);
+        }
+      }
+
+      ret = poll(&pfd, 1, TIMEOUT_MS);
+    }
+  }
+
+  bool windowIsFull() { return nackedPacketsCount >= WINDOW_SIZE; }
+
+  void resendAllNackedPackets() {
+    for (TransfererHeader &nacked : nackedPacketsBuffer) {
+      sockSend(nacked);
+    }
+  }
+  void handleFullWindow() {
+    sleep_for(std::chrono::milliseconds(TIMEOUT_MS));
+
+    pollAcks();
+
+    if (!windowIsFull()) {
+      return;
+    }
+
+    resendAllNackedPackets();
+  }
+
   void streamFile(const string checksum) {
-    struct TransfererHeader data;
+    TransfererHeader packet;
+    vector<unsigned char> buffer(1024);
 
     int sequence = 0;
 
     while (!file.eof()) {
 
-        int temp = nackedPacketsCount;
-        struct TransfereeHeader header;
-        ssize_t bytesReceived;
-        socklen_t clientLen = sizeof(clientAddress);
+      pollAcks();
 
-        int ret = poll(&pfd, 1, TIMEOUT_MS);
-
-        while (ret > 0) {
-          bytesReceived =
-              recvfrom(serverSocket, &header, sizeof(header), 0,
-                       (sockaddr *)&clientAddress, &clientLen);
-
-          if (header.flags == TransferFlags::ACK) {
-
-		  bool erased = false;
-            for (int i = 0; i < nackedBuffer.size(); i++) {
-
-              if (nackedBuffer[i].sequence == header.sequence) {
-                nackedBuffer.erase(nackedBuffer.begin() + i);
-                nackedPacketsCount--;
-		erased = true;
-                break;
-              }
-            }
-	    if (!erased && header.sequence == nackedBuffer[0].sequence - 1) {
-              for (auto& nacked: nackedBuffer){
-	        sendto(serverSocket, &nacked, sizeof(nacked), 0, (sockaddr *)&clientAddress,
-		     sizeof(clientAddress));
-	      }
-	    }
-          }
-          ret = poll(&pfd, 1, TIMEOUT_MS);
-        } 
-      if (nackedPacketsCount >= WINDOW_SIZE) {
+      if (windowIsFull()) {
         cout << "window is full\n";
-	for (auto& nacked: nackedBuffer){
-		sendto(serverSocket, &nacked, sizeof(nacked), 0, (sockaddr *)&clientAddress,
-				sizeof(clientAddress));
-	}
-	continue;
+        handleFullWindow();
+        continue;
       }
 
-      if (readFileChunk(data) == FAIL) {
+      int bytesRead = readFileChunk(buffer);
+
+      if (bytesRead <= 0) {
         cout << "failed to stream file: file not opened\n";
         exit(-1);
       }
 
-      data.sequence = sequence;
+      packet = createPacket(buffer, bytesRead, sequence, TransferFlags::DATA);
 
-      sendto(serverSocket, &data, sizeof(data), 0, (sockaddr *)&clientAddress,
-             sizeof(clientAddress));
-
-      nackedBuffer.push_back(data);
-      nackedPacketsCount++;
-
+      sendPacket(packet);
       sequence++;
     }
 
-    readFileChunk(data);
+    packet.sequence = sequence;
+    packet.flags = TransferFlags::FIN;
+    memccpy(packet.data, checksum.c_str(), 0, checksum.size());
+    packet.data[checksum.size()] = 0;
 
-    data.sequence = sequence;
-    memccpy(data.data, checksum.c_str(), 0, checksum.size());
-    data.data[checksum.size()] = 0;
-    sendto(serverSocket, &data, sizeof(data), 0, (sockaddr *)&clientAddress,
-           sizeof(clientAddress));
+    sockSend(packet);
 
-    nackedBuffer.push_back(data);
+    nackedPacketsBuffer.push_back(packet);
     nackedPacketsCount++;
 
     while (nackedPacketsCount > 0) {
-      struct TransfereeHeader header;
-
-      socklen_t clientLen = sizeof(clientAddress);
-      ssize_t bytesReceived = recvfrom(serverSocket, &header, sizeof(header), 0,
-                                       (sockaddr *)&clientAddress, &clientLen);
-
-      if (header.flags == TransferFlags::ACK) {
-
-        for (int i = 0; i < nackedBuffer.size(); i++) {
-
-          if (nackedBuffer[i].sequence == header.sequence) {
-            nackedBuffer.erase(nackedBuffer.begin() + i);
-            nackedPacketsCount--;
-            break;
-          }
-        }
-      }
+      pollAcks();
+      resendAllNackedPackets();
+      sleep_for(std::chrono::milliseconds(TIMEOUT_MS));
     }
   }
+
+  void resetTimeout() {
+    packetTimer.timeoutClock = clock() + packetTimer.estimatedTimeout;
+  }
+
+  void initTimeout(uint32_t sequence) {
+    packetTimer.packetSequence = sequence;
+    packetTimer.sendClock = clock();
+    resetTimeout();
+  }
+
+  void sockSend(TransfererHeader &data) {
+    sendto(serverSocket, &data, sizeof(data), 0, (sockaddr *)&clientAddress,
+           sizeof(clientAddress));
+  }
+
+  void sockSend(string str) {
+    sendto(serverSocket, str.c_str(), str.size(), 0, (sockaddr *)&clientAddress,
+           sizeof(clientAddress));
+  }
 };
+
 int main() {
   Server server;
   return 0;

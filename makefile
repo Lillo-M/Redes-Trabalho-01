@@ -1,6 +1,6 @@
 all:
-	g++ client.cpp -o client
-	g++ server.cpp -o server
+	g++ -ggdb client.cpp -o client
+	g++ -ggdb server.cpp -o server
 
 clean:
 	rm client server
