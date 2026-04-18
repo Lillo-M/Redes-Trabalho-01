@@ -1,12 +1,18 @@
 #include <arpa/inet.h>
 #include <bits/stdc++.h>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <netinet/in.h>
 #include <ostream>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+
+using std::this_thread::sleep_for;
 
 using namespace std;
 
@@ -15,6 +21,7 @@ using namespace std;
 
 #define DEFAULT_PORT 8080
 #define TIMEOUT_MS 13
+#define WAIT_RESPONSE_TIMEOUT_MS 50
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define MAXLINE 1024
@@ -80,6 +87,22 @@ public:
     return file.is_open();
   }
 
+  void createFileDirectory(const string &filename) {
+    namespace fs = filesystem;
+
+    fs::path path(filename);
+
+    path.remove_filename();
+
+    fs::path fullPath = fs::current_path() / path;
+
+    if (fs::exists(fullPath) || !path.has_parent_path()) {
+      return;
+    }
+
+    fs::create_directories(fullPath);
+  }
+
   bool writeBuffer(const char *buffer, size_t size) {
     if (!file.is_open())
       return false;
@@ -95,6 +118,14 @@ public:
   }
 };
 
+void closeSocketAtExit(int status, void *socket) {
+  if (*((int *)socket) >= 0) {
+    close(*((int *)socket));
+    *((int *)socket) = -1;
+    return;
+  }
+}
+
 class Client {
 public:
   string ipv4 = "";
@@ -103,6 +134,7 @@ public:
   socklen_t len = sizeof(serverAddress);
   int serverSocket = -1;
   string filename = "";
+  string filenameToSaveAs = "";
   PacketTimer packetTimer;
   pollfd pfd{};
   TransfererHeader packetBuff{};
@@ -113,6 +145,7 @@ public:
       perror("socket creation failed");
       exit(EXIT_FAILURE);
     }
+    on_exit(closeSocketAtExit, &serverSocket);
   }
   void setupServerAddress() {
     memset(&serverAddress, 0, sizeof(serverAddress));
@@ -126,7 +159,7 @@ public:
     } else {
       if (inet_pton(AF_INET, ipv4.c_str(), &serverAddress.sin_addr) != 1) {
         cout << "invalid ip\n";
-        exit(-1); // invalid IP
+        exit(EXIT_FAILURE); // invalid IP
       }
     }
   }
@@ -136,6 +169,25 @@ public:
                sizeof(receiveBufferSize));
   }
 
+  void sendRequest() {
+    int ret = poll(&pfd, 1, TIMEOUT_MS);
+
+    int timeouts = 0;
+
+    do {
+      sendto(serverSocket, &packetBuff, sizeof(packetBuff), MSG_CONFIRM,
+             (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+      sleep_for(std::chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
+
+      ret = poll(&pfd, 1, TIMEOUT_MS);
+
+      timeouts++;
+      if (timeouts > 100) {
+        cout << "timeout: server stopped responding.\n" << endl;
+        exit(-1);
+      }
+    } while (ret == 0);
+  }
   Client(int argc, char **argv) {
     if (argc < 2) {
       cout << "Insert server ip address: ";
@@ -143,8 +195,11 @@ public:
 
       cout << "Retrieve file named: ";
       cin >> filename;
-    } else if (argc == 3) {
-      handleApplicationArgs(argv);
+      std::printf("Save as (no input will save the file as `%s`): ",
+                  filename.c_str());
+      cin >> filenameToSaveAs;
+    } else if (argc == 3 || argc == 4) {
+      handleApplicationArgs(argv, argc);
     } else {
       argsUsageError();
       return;
@@ -156,35 +211,38 @@ public:
 
     setupServerAddress();
 
+    setupPollDescriptor();
+
     setSocketReceiveBufferSize(RECEIVE_BUFFER_SIZE);
 
     int ret = tryHandshake();
     if (ret < 0) {
       cout << "handshake failed\n";
-      exit(-1);
+      exit(EXIT_FAILURE);
     }
 
     memccpy(packetBuff.data, request.c_str(), 0, 1023);
-    // Send message to server
-    sendto(serverSocket, &packetBuff, sizeof(packetBuff), MSG_CONFIRM,
-           (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
-    cout << "Hello message sent.\n";
+
+    sendRequest();
 
     TransfererHeader ack{0};
 
     int sequence = 0;
 
     FileWriter fileWriter;
-    fileWriter.openFile(request);
+
+    fileWriter.createFileDirectory(filenameToSaveAs);
+
+    if (!fileWriter.openFile(filenameToSaveAs)) {
+      printf("Failed to open file `%s`\n", filenameToSaveAs.c_str());
+      exit(EXIT_FAILURE);
+    }
 
     // Receive reply from server
     while (true) {
       TransfererHeader ackPacket;
       int n = recvfrom(serverSocket, &ackPacket, sizeof(ackPacket), MSG_WAITALL,
                        (struct sockaddr *)&serverAddress, &len);
-
-      std::printf("Seq: %d, ack: %d, data: |`%s`|\n", ackPacket.sequence,
-                  ackPacket.ackNumber, ackPacket.data);
 
       if (ackPacket.flags & TransferFlags::DATA) {
 
@@ -212,7 +270,8 @@ public:
       } else if (ackPacket.flags & TransferFlags::FIN) {
         fileWriter.closeFile();
         cout << "Server: Transmition ended checksum"
-             << (compareFileSha256(request, string((char *)ackPacket.data))
+             << (compareFileSha256(filenameToSaveAs,
+                                   string((char *)ackPacket.data))
                      ? "Success"
                      : "Failed")
              << " -> " << ackPacket.data << endl;
@@ -222,16 +281,25 @@ public:
     }
 
     // Close socket
-    close(serverSocket);
+    closeSocket();
     return;
   }
 
-  void argsUsageError() {
-    cout << "usage: ./client <ipv4>:<port> <filepath>\n";
-    exit(-1);
+  void closeSocket() {
+    if (serverSocket >= 0) {
+      close(serverSocket);
+    }
+    serverSocket = -1;
   }
 
-  void handleApplicationArgs(char **arguments) {
+  void argsUsageError() {
+    cout << "usage: ./client <ipv4>:<port> <file_path> <save_as>\n"
+            "save_as (optional): Is the directory/name to save the file in the "
+            "client machine\n";
+    exit(EXIT_FAILURE);
+  }
+
+  void handleApplicationArgs(char **arguments, int length) {
     string address(arguments[1]);
     regex pattern("^((((?!25?[6-9])[12]\\d|[1-9])?\\d\\.?\\b){4}):("
                   "[0-9]{1,5})$");
@@ -246,15 +314,17 @@ public:
 
     if (65536 <= port) {
       cout << "invalid port number: " << port << endl;
-      exit(-1);
+      exit(EXIT_FAILURE);
     }
 
     ipv4 = match[1];
 
     filename = arguments[2];
 
+    filenameToSaveAs = length == 4 ? arguments[3] : filename;
+
     cout << "ipv4: " << ipv4 << "\nport: " << port << "\nfilename: " << filename
-         << endl;
+         << "\ndownloading as: " << filenameToSaveAs << endl;
   }
 
   int tryHandshake() {
@@ -283,7 +353,6 @@ public:
                             .data = ""};
 
     sockSend(packet);
-    initTimeout(packet.sequence);
     packetBuff = packet;
   }
 
@@ -308,16 +377,14 @@ public:
     int ret = poll(&pfd, 1, TIMEOUT_MS);
 
     int timeouts = 0;
-    while (timeouts < 3) {
+    while (timeouts < 100) {
       ret = poll(&pfd, 1, TIMEOUT_MS);
-      if (ret == 0) {
+      if (ret > 0) {
         return 0;
       }
-      if (clock() >= packetTimer.timeoutClock) {
-        timeouts++;
-        initTimeout(packetTimer.packetSequence);
-        sockSend(packetBuff);
-      }
+      sleep_for(std::chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
+      timeouts++;
+      sockSend(packetBuff);
     }
     return -1;
   }

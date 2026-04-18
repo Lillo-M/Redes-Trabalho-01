@@ -56,6 +56,14 @@ typedef struct PacketTimer {
   uint32_t packetSequence = 0;
 } PacketTimer;
 
+void closeSocketAtExit(int status, void *socket) {
+  if (*((int *)socket) >= 0) {
+    close(*((int *)socket));
+    *((int *)socket) = -1;
+    return;
+  }
+}
+
 class Server {
 
 public:
@@ -69,6 +77,7 @@ public:
   int nackedPacketsCount = 0;
   string ipv4 = "";
   PacketTimer packetTimer;
+  int clientKeepAliveTimeout;
 
   void inputIpAddress() {
     cout << "Server address: ";
@@ -100,6 +109,7 @@ public:
       cout << "failed to bind\n";
       exit(-1);
     }
+    on_exit(closeSocketAtExit, &serverSocket);
   }
 
   void setupPollDescriptor() {
@@ -131,7 +141,14 @@ public:
     handleRequest(request);
 
     // closing the socket.
-    close(serverSocket);
+    closeSocket();
+  }
+
+  void closeSocket() {
+    if (serverSocket >= 0) {
+      close(serverSocket);
+    }
+    serverSocket = -1;
   }
 
   unsigned long getFileSize(const string &filename) {
@@ -382,6 +399,7 @@ public:
   }
 
   void pollAcks() {
+    clientKeepAliveTimeout++;
     TransfererHeader header;
     ssize_t bytesReceived;
 
@@ -390,14 +408,6 @@ public:
     while (ret > 0 && nackedPacketsCount > 0) {
       bytesReceived = recvfrom(serverSocket, &header, sizeof(header), 0,
                                (sockaddr *)&clientAddress, &clientLen);
-
-      if (bytesReceived > 0)
-        std::printf(
-            "\n================================================================"
-            "====================================\nSeq: %d, ack: %d, data: "
-            "|`%s`|\n=========================================================="
-            "==========================================\n",
-            header.sequence, header.ackNumber, header.data);
 
       if (header.flags == TransferFlags::ACK) {
 
@@ -419,6 +429,7 @@ public:
       }
 
       ret = poll(&pfd, 1, TIMEOUT_MS);
+      clientKeepAliveTimeout = 0;
     }
   }
 
