@@ -377,7 +377,7 @@ public:
     int ret = poll(&pfd, 1, TIMEOUT_MS);
 
     int timeouts = 0;
-    while (timeouts < 100) {
+    while (timeouts < 10000) {
       ret = poll(&pfd, 1, TIMEOUT_MS);
       if (ret > 0) {
         return 0;

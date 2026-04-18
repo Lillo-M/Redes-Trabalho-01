@@ -327,9 +327,18 @@ public:
 
     sendEstab(header);
 
-    waitForEstabOrTimeout();
+    int timeouts = 0;
+    do {
+      waitForEstabOrTimeout();
 
-    return receiveEstab(header);
+      ret = receiveEstab(header);
+
+      timeouts++;
+      if (timeouts >= 100) {
+        return -2;
+      }
+    } while (ret == -2);
+    return ret;
   }
 
   int waitForEstabOrTimeout() {
