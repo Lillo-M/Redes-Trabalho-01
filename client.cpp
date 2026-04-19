@@ -188,6 +188,25 @@ public:
       }
     } while (ret == 0);
   }
+
+  void askRetrasmition(int sequence) {
+    TransfererHeader ack{0};
+    ack.sequence = sequence - 1;
+    ack.ackNumber = sequence - 1;
+    ack.flags = TransferFlags::ACK;
+    sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
+           (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+  }
+
+  void sendAck(int sequence) {
+    TransfererHeader ack{0};
+    ack.sequence = sequence;
+    ack.ackNumber = sequence;
+    ack.flags = TransferFlags::ACK;
+    sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
+           (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+  }
+
   Client(int argc, char **argv) {
     if (argc < 2) {
       cout << "Insert server ip address: ";
@@ -244,39 +263,27 @@ public:
       int n = recvfrom(serverSocket, &ackPacket, sizeof(ackPacket), MSG_WAITALL,
                        (struct sockaddr *)&serverAddress, &len);
 
-      if (ackPacket.flags & TransferFlags::DATA) {
-
-        if (ackPacket.sequence >= sequence) {
-          if (ackPacket.sequence == sequence) {
-            fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
-          }
-
-          ack.sequence = ackPacket.sequence;
-          ack.ackNumber = ackPacket.sequence;
-          ack.flags = TransferFlags::ACK;
-          sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
-                 (const struct sockaddr *)&serverAddress,
-                 sizeof(serverAddress));
-
-          sequence += !(ackPacket.sequence > sequence);
-        } else {
-          ack.sequence = ackPacket.sequence;
-          ack.flags = TransferFlags::ACK;
-          sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
-                 (const struct sockaddr *)&serverAddress,
-                 sizeof(serverAddress));
+      if (ackPacket.sequence == sequence) {
+        if (ackPacket.flags & TransferFlags::DATA) {
+          printf("Sequence: %d\n", ackPacket.sequence);
+          fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
+          sendAck(sequence);
+          sequence++;
+        } else if (ackPacket.flags &
+                   TransferFlags::FIN) { // TODO: arrumar para caso algum pacote
+                                         // foi atrasado e o FIN chegou antes de
+                                         // terminar de montar o arquivo
+          fileWriter.closeFile();
+          cout << "Server: Transmition ended checksum "
+               << (compareFileSha256(filenameToSaveAs,
+                                     string((char *)ackPacket.data))
+                       ? "Succeeded"
+                       : "Failed")
+               << " -> " << ackPacket.data << endl;
+          break;
         }
-
-      } else if (ackPacket.flags & TransferFlags::FIN) {
-        fileWriter.closeFile();
-        cout << "Server: Transmition ended checksum"
-             << (compareFileSha256(filenameToSaveAs,
-                                   string((char *)ackPacket.data))
-                     ? "Success"
-                     : "Failed")
-             << " -> " << ackPacket.data << endl;
-        ;
-        break;
+      } else {
+        askRetrasmition(sequence);
       }
     }
 

@@ -25,7 +25,7 @@ using namespace std;
 
 #define PORT 8080
 #define FAIL -1
-#define TIMEOUT_MS 13
+#define TIMEOUT_MS 0
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define PAYLOAD_SIZE 1024
@@ -421,14 +421,13 @@ public:
       if (header.flags == TransferFlags::ACK) {
 
         bool acked = false;
-        for (int i = 0; i < nackedPacketsBuffer.size(); i++) {
+        for (int i = 0; i < nackedPacketsCount; i++) {
 
-          if (nackedPacketsBuffer[i].sequence == header.sequence) {
-            nackedPacketsBuffer.erase(nackedPacketsBuffer.begin(),
-                                      nackedPacketsBuffer.begin() + i);
-            nackedPacketsCount -= i + 1;
+          if (nackedPacketsBuffer[i].sequence <= header.sequence) {
+            nackedPacketsBuffer.erase(nackedPacketsBuffer.begin() + i);
+            nackedPacketsCount--;
             acked = true;
-            break;
+	    i = -1;
           }
         }
 
