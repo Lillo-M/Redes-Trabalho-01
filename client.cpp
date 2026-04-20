@@ -20,7 +20,7 @@ using namespace std;
 #include <string>
 
 #define DEFAULT_PORT 8080
-#define TIMEOUT_MS 13
+#define TIMEOUT_MS 0
 #define WAIT_RESPONSE_TIMEOUT_MS 50
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
@@ -128,6 +128,7 @@ void closeSocketAtExit(int status, void *socket) {
 
 class Client {
 public:
+  int losePacketChance = 0;
   string ipv4 = "";
   int port = DEFAULT_PORT;
   struct sockaddr_in serverAddress{};
@@ -175,8 +176,7 @@ public:
     int timeouts = 0;
 
     do {
-      sendto(serverSocket, &packetBuff, sizeof(packetBuff), MSG_CONFIRM,
-             (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+      sockSend(packetBuff);
       sleep_for(std::chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
 
       ret = poll(&pfd, 1, TIMEOUT_MS);
@@ -194,8 +194,7 @@ public:
     ack.sequence = sequence - 1;
     ack.ackNumber = sequence - 1;
     ack.flags = TransferFlags::ACK;
-    sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
-           (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+    sockSend(ack);
   }
 
   void sendAck(int sequence) {
@@ -203,8 +202,7 @@ public:
     ack.sequence = sequence;
     ack.ackNumber = sequence;
     ack.flags = TransferFlags::ACK;
-    sendto(serverSocket, &ack, sizeof(ack), MSG_CONFIRM,
-           (const struct sockaddr *)&serverAddress, sizeof(serverAddress));
+    sockSend(ack);
   }
 
   Client(int argc, char **argv) {
@@ -262,6 +260,8 @@ public:
       TransfererHeader ackPacket;
       int n = recvfrom(serverSocket, &ackPacket, sizeof(ackPacket), MSG_WAITALL,
                        (struct sockaddr *)&serverAddress, &len);
+      if (rand() % 100 < losePacketChance)
+        continue;
 
       if (ackPacket.sequence == sequence) {
         if (ackPacket.flags & TransferFlags::DATA) {
@@ -412,6 +412,8 @@ public:
   }
 
   void sockSend(TransfererHeader &data) {
+    if (rand() % 100 < losePacketChance)
+      return;
     sendto(serverSocket, &data, sizeof(data), 0,
            (struct sockaddr *)&serverAddress, sizeof(serverAddress));
   }

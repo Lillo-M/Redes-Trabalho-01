@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -73,7 +74,7 @@ public:
   int serverSocket = -1;
   sockaddr_in clientAddress{};
   ifstream file = ifstream();
-  vector<TransfererHeader> nackedPacketsBuffer = vector<TransfererHeader>(1024);
+  deque<TransfererHeader> nackedPacketsBuffer = deque<TransfererHeader>(1024);
   int nackedPacketsCount = 0;
   string ipv4 = "";
   PacketTimer packetTimer;
@@ -421,16 +422,12 @@ public:
       if (header.flags == TransferFlags::ACK) {
 
         bool acked = false;
-        for (int i = 0; i < nackedPacketsCount; i++) {
-
-          if (nackedPacketsBuffer[i].sequence <= header.sequence) {
-            nackedPacketsBuffer.erase(nackedPacketsBuffer.begin() + i);
-            nackedPacketsCount--;
-            acked = true;
-	    i = -1;
-          }
+        while (!nackedPacketsBuffer.empty() &&
+               nackedPacketsBuffer.front().sequence <= header.sequence) {
+          nackedPacketsBuffer.pop_front();
+          nackedPacketsCount--;
+          acked = true;
         }
-
         if (!acked) {
           handlePacketLoss(header);
         }
