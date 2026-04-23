@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -11,10 +12,14 @@
 #include <fstream>
 #include <iostream>
 #include <netinet/in.h>
+#include <ostream>
 #include <poll.h>
+#include <pthread.h>
 #include <regex>
+#include <signal.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
@@ -28,8 +33,9 @@ using namespace std;
 #define FAIL -1
 #define TIMEOUT_MS 0
 #define POLL_REQUESTS_TIMEOUT 5000
+#define WAIT_RESPONSE_TIMEOUT_MS 50
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
-#define PAYLOAD_SIZE 1024
+#define PAYLOAD_SIZE 536
 
 #define WINDOW_SIZE 100
 
@@ -39,6 +45,8 @@ enum TransferFlags {
   FIN = (1 << 2),
   SYN = (1 << 3),
 };
+
+enum State { SlowStart, CongestionAvoidance, FastRecovery };
 
 typedef struct TransfererHeader {
   uint32_t sequence;
@@ -74,11 +82,57 @@ public:
   int serverSocket = -1;
   sockaddr_in clientAddress{};
   ifstream file = ifstream();
-  deque<TransfererHeader> nackedPacketsBuffer = deque<TransfererHeader>(1024);
+  deque<TransfererHeader> nackedPacketsBuffer = deque<TransfererHeader>();
   int nackedPacketsCount = 0;
   string ipv4 = "";
   PacketTimer packetTimer;
   int clientKeepAliveTimeout;
+  uint32_t fileSize = 0;
+  static uint32_t cwnd;
+  static uint32_t ssthresh;
+  static State state;
+  static Server *instance;
+  struct itimerval timer{0};
+
+  Server() {
+    if (!instance) {
+      instance = this;
+    }
+
+    signal(SIGALRM, Server::timeoutHandler);
+
+    inputIpAddress();
+
+    // creating socket
+    serverSocket = socket(AF_INET, SOCK_DGRAM,
+                          0); // DGRAM -> manual disse que DGRAM seria
+                              // datagramas, suponho então que seja uma conexão
+                              // udp, já que as outras são 'confiaveis'
+
+    // specifying the address
+    setupServerAddress();
+
+    // binding socket.
+    bindSocket();
+
+    setupPollDescriptor();
+
+    pollConections();
+
+    string request = waitForRequest();
+
+    cout << "Message from client: " << request << endl;
+
+    handleRequest(request);
+
+    finHandshake();
+    TransfererHeader header;
+    sockReceive(header);
+    printf("%d, %d, %d, %d\n", header.ackNumber, header.sequence, header.dataSize, header.flags);
+
+    // closing the socket.
+    closeSocket();
+  }
 
   void inputIpAddress() {
     cout << "Server address: ";
@@ -118,31 +172,27 @@ public:
     pfd.events = POLLIN;
   }
 
-  Server() {
-    inputIpAddress();
+  static void timeoutHandler(int signum) {
+    state = SlowStart;
+    ssthresh = cwnd / 2;
+    cwnd = 1;
+    instance->timedOut();
+    printf("Timeout: State changed to Slow Start | signum '%d'\n", signum);
+  }
 
-    // creating socket
-    serverSocket = socket(AF_INET, SOCK_DGRAM,
-                          0); // DGRAM -> manual disse que DGRAM seria
-                              // datagramas, suponho então que seja uma conexão
-                              // udp, já que as outras são 'confiaveis'
+  void startTimer() {
+    if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
+      perror("Error calling setitimer()");
+      exit(1);
+    }
+  }
+  void setTimer(time_t us) {
+    int seconds = us / (1000 * 1000);
+    timer.it_value.tv_sec = seconds;
+    timer.it_value.tv_usec = us % (1000 * 1000);
 
-    // specifying the address
-    setupServerAddress();
-
-    // binding socket.
-    bindSocket();
-
-    setupPollDescriptor();
-
-    string request = pollRequest();
-
-    cout << "Message from client: " << request << endl;
-
-    handleRequest(request);
-
-    // closing the socket.
-    closeSocket();
+    timer.it_interval.tv_sec = 0;
+    timer.it_interval.tv_usec = 0;
   }
 
   void closeSocket() {
@@ -171,6 +221,10 @@ public:
 
   void openFile(const std::string &filename) {
     file.open(filename, ios::binary);
+    file.seekg(0, ios::end);
+    fileSize = file.tellg();
+    file.seekg(0);
+    file.clear();
   }
 
   void closeFile() { file.close(); }
@@ -259,6 +313,11 @@ public:
                     (sockaddr *)&clientAddress, &clientLen);
   }
 
+  ssize_t sockPeek(TransfererHeader &header) {
+    return recvfrom(serverSocket, &header, sizeof(header), MSG_PEEK,
+                    (sockaddr *)&clientAddress, &clientLen);
+  }
+
   void sendPacket(TransfererHeader &packet) {
     sockSend(packet);
 
@@ -284,16 +343,21 @@ public:
   }
 
   int receiveSyn(TransfererHeader &header) {
-    ssize_t bytesReceived = sockReceive(header);
+    ssize_t bytesReceived = sockPeek(header);
 
     if (bytesReceived <= 0) {
-      cout << "Failed to receive\n";
+      cout << "Failed to peek\n";
       return -1;
     }
 
     if (header.flags != TransferFlags::SYN) {
       cout << "handshake failed\n";
       return -2;
+    }
+
+    if (sockReceive(header) <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
     }
     return 0;
   }
@@ -317,7 +381,67 @@ public:
     return 0;
   }
 
-  int tryHandshake() {
+  void sendFin() {
+    TransfererHeader packet{.sequence = static_cast<uint32_t>(rand() % 100),
+                            .ackNumber = 0,
+                            .dataSize = 0,
+                            .flags = TransferFlags::FIN,
+                            .data = ""};
+
+    sendPacket(packet);
+    initTimeout(packet.sequence);
+  }
+
+  int receiveFinAck(TransfererHeader &header) {
+    ssize_t bytesReceived = sockPeek(header);
+
+    if (bytesReceived <= 0) {
+      cout << "Failed to peek\n";
+      return -1;
+    }
+
+    if (header.flags != (TransferFlags::ACK & TransferFlags::FIN) ||
+        header.ackNumber != packetTimer.packetSequence + 1) {
+      cout << "FIN handshake failed\n";
+      return -2;
+    }
+
+    if (sockReceive(header) <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
+    }
+    return 0;
+  }
+
+  void finHandshake() {
+    TransfererHeader header;
+
+    sendFin();
+
+    for (int i = 0; i <= 100 && receiveFinAck(header); i++) {
+      sleep_for(chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
+
+      if (i == 100) {
+        cout << "timeout: client stopped responding.\n" << endl;
+        exit(-1);
+      }
+    }
+
+    sendFinAck(header);
+  }
+
+  void sendFinAck(TransfererHeader &header) {
+    TransfererHeader packet{.sequence = 0,
+                            .ackNumber = header.sequence + 1,
+                            .dataSize = 0,
+                            .flags = ACK & FIN,
+                            .data = ""};
+
+    sendPacket(packet);
+    initTimeout(packet.sequence);
+  }
+
+  int tryThreeWayHandshake() {
     TransfererHeader header;
 
     int ret = receiveSyn(header);
@@ -381,15 +505,13 @@ public:
     }
   }
 
-  string pollRequest() {
+  void pollConections() {
     int handshake = -2;
     while (handshake < 0) {
       waitForPackets();
 
-      handshake = tryHandshake();
+      handshake = tryThreeWayHandshake();
     }
-
-    return waitForRequest();
   }
 
   string waitForRequest() {
@@ -398,48 +520,144 @@ public:
 
       return string("");
     }
+
     TransfererHeader packet{};
     ssize_t bytesReceived = sockReceive(packet);
+
     if (bytesReceived <= 0) {
       cout << "Failed to receive\n";
       return string("");
     }
+
     packet.data[PAYLOAD_SIZE - 1] = 0;
     return string(packet.data);
   }
 
-  void pollAcks() {
-    clientKeepAliveTimeout++;
+  void setTimeout(bool hasTimedOut) {
+    float alpha = 1.f / 8;
+    float beta = 1.f / 4;
+
+    struct itimerval curr_value;
+    if (getitimer(ITIMER_REAL, &curr_value) == -1) {
+      perror("Error calling getitimer()");
+      exit(1);
+    }
+    time_t timeLeft = (curr_value.it_value.tv_sec * 1000 +
+                       curr_value.it_value.tv_usec / 1000);
+
+    static time_t EstimatedRTT = 500 * 4 / 3, DevRTT = 0, lastTimeoutLen = 0;
+    time_t SampleRTT = lastTimeoutLen - timeLeft;
+
+    if (hasTimedOut) {
+      EstimatedRTT *= 2;
+    }
+
+    EstimatedRTT = (1 - alpha) * EstimatedRTT + alpha * SampleRTT;
+
+    DevRTT = (1 - beta) * DevRTT + beta * abs(SampleRTT - EstimatedRTT);
+
+    lastTimeoutLen = (EstimatedRTT + 4 * DevRTT);
+
+    setTimer(lastTimeoutLen * 1000);
+    startTimer();
+  }
+
+  void acknowledgePacket(TransfererHeader &header) {
+    setTimeout(false);
+
+    switch (state) {
+    case SlowStart:
+      cwnd *= 2;
+      break;
+    case CongestionAvoidance:
+      cwnd = cwnd + PAYLOAD_SIZE * PAYLOAD_SIZE / cwnd;
+      break;
+    case FastRecovery:
+      cwnd = ssthresh;
+      avoidCongestion();
+      break;
+    }
+
+    printf("Ack Received, cwnd `%u`\n", cwnd);
+
+    while (!nackedPacketsBuffer.empty() &&
+           nackedPacketsBuffer.front().sequence <= header.sequence) {
+      nackedPacketsBuffer.pop_front();
+      nackedPacketsCount--;
+    }
+    if (cwnd >= ssthresh) {
+      avoidCongestion();
+    }
+  }
+
+  void pollAcks(int sequence) {
     TransfererHeader header;
     ssize_t bytesReceived;
 
     int ret = poll(&pfd, 1, TIMEOUT_MS);
 
-    while (ret > 0 && nackedPacketsCount > 0) {
-      bytesReceived = recvfrom(serverSocket, &header, sizeof(header), 0,
-                               (sockaddr *)&clientAddress, &clientLen);
+    static int lastAck = -1;
+    static int AckDupCount = 0;
+
+    int i;
+    for (i = 0; i < 100 && ret == 0; i++) {
+      ret = poll(&pfd, 1, TIMEOUT_MS);
+    }
+    if (100 == i) {
+      return;
+    }
+
+    while (ret > 0) {
+      bytesReceived = sockReceive(header);
 
       if (header.flags == TransferFlags::ACK) {
+        if (lastAck == header.ackNumber) {
+          AckDupCount++;
 
-        bool acked = false;
-        while (!nackedPacketsBuffer.empty() &&
-               nackedPacketsBuffer.front().sequence <= header.sequence) {
-          nackedPacketsBuffer.pop_front();
-          nackedPacketsCount--;
-          acked = true;
+          if (AckDupCount == 3) {
+            tripleAcks(header.ackNumber);
+            return;
+          }
+
+          continue;
         }
-        if (!acked) {
-          handlePacketLoss(header);
-        }
+
+        AckDupCount = 0;
+        lastAck = header.ackNumber;
+        acknowledgePacket(header);
       }
 
       ret = poll(&pfd, 1, TIMEOUT_MS);
-      clientKeepAliveTimeout = 0;
     }
   }
 
+  void tripleAcks(int ackNumber) {
+    switch (state) {
+    case SlowStart:
+    case CongestionAvoidance:
+      ssthresh = cwnd / 2;
+      cwnd = ssthresh + 3;
+      fastRecover(ackNumber);
+      state = FastRecovery;
+      break;
+    case FastRecovery:
+      cwnd += 1;
+      fastRecover(ackNumber);
+      break;
+    }
+  }
+
+  void fastRecover(int ackNumber) {}
+
+  void avoidCongestion() { state = CongestionAvoidance; }
+
   bool windowIsFull() { return nackedPacketsCount >= WINDOW_SIZE; }
 
+  void timedOut() {
+    assert(nackedPacketsCount > 0);
+    setTimeout(true);
+    sockSend(nackedPacketsBuffer.front());
+  }
   void resendAllNackedPackets() {
     for (TransfererHeader &nacked : nackedPacketsBuffer) {
       sockSend(nacked);
@@ -448,7 +666,7 @@ public:
   void handleFullWindow() {
     sleep_for(std::chrono::milliseconds(TIMEOUT_MS));
 
-    pollAcks();
+    // pollAcks();
 
     if (!windowIsFull()) {
       return;
@@ -457,37 +675,41 @@ public:
     resendAllNackedPackets();
   }
 
-  void streamFile(const string checksum) {
+  void sendPacketWindow(int &sequence) {
+    vector<unsigned char> buffer(PAYLOAD_SIZE);
     TransfererHeader packet;
-    vector<unsigned char> buffer(1024);
 
-    int sequence = 0;
-
-    while (!file.eof()) {
-
-      pollAcks();
-
-      if (windowIsFull()) {
-        cout << "window is full\n";
-        handleFullWindow();
-        continue;
-      }
+    for (int i = 0; i < cwnd && fileSize > 0; i++) {
 
       int bytesRead = readFileChunk(buffer);
+      fileSize -= bytesRead;
 
-      if (bytesRead <= 0) {
+      if (bytesRead < 0) {
         cout << "failed to stream file: file not opened\n";
         exit(-1);
       }
 
-      packet = createPacket(buffer, bytesRead, sequence, TransferFlags::DATA);
+      if (bytesRead <= 0 && fileSize <= 0) {
+        return;
+      }
 
+      packet = createPacket(buffer, bytesRead, sequence, DATA);
       sendPacket(packet);
       sequence++;
     }
+  }
 
+  void streamFile(const string checksum) {
+    int sequence = 0;
+
+    while (fileSize > 0) {
+      sendPacketWindow(sequence);
+      pollAcks(sequence);
+    }
+
+    TransfererHeader packet{0};
     packet.sequence = sequence;
-    packet.flags = TransferFlags::FIN;
+    packet.flags = FIN | DATA;
     memccpy(packet.data, checksum.c_str(), 0, checksum.size());
     packet.data[checksum.size()] = 0;
 
@@ -495,11 +717,8 @@ public:
 
     nackedPacketsBuffer.push_back(packet);
     nackedPacketsCount++;
-
     while (nackedPacketsCount > 0) {
-      pollAcks();
-      resendAllNackedPackets();
-      sleep_for(std::chrono::milliseconds(TIMEOUT_MS));
+      pollAcks(sequence);
     }
   }
 
@@ -524,7 +743,13 @@ public:
   }
 };
 
+State Server::state(SlowStart);
+uint32_t Server::cwnd(1);
+uint32_t Server::ssthresh(128);
+Server *Server::instance(nullptr);
+
 int main() {
+  srand(time(nullptr));
   Server server;
   return 0;
 }

@@ -2,6 +2,7 @@
 #include <bits/stdc++.h>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <netinet/in.h>
 #include <ostream>
@@ -21,7 +22,7 @@ using namespace std;
 
 #define DEFAULT_PORT 8080
 #define TIMEOUT_MS 0
-#define WAIT_RESPONSE_TIMEOUT_MS 50
+#define WAIT_RESPONSE_TIMEOUT_MS 500
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define MAXLINE 1024
@@ -264,15 +265,12 @@ public:
         continue;
 
       if (ackPacket.sequence == sequence) {
-        if (ackPacket.flags & TransferFlags::DATA) {
+        if (ackPacket.flags == TransferFlags::DATA) {
           printf("Sequence: %d\n", ackPacket.sequence);
           fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
           sendAck(sequence);
           sequence++;
-        } else if (ackPacket.flags &
-                   TransferFlags::FIN) { // TODO: arrumar para caso algum pacote
-                                         // foi atrasado e o FIN chegou antes de
-                                         // terminar de montar o arquivo
+        } else if (ackPacket.flags & (FIN | DATA)) {
           fileWriter.closeFile();
           cout << "Server: Transmition ended checksum "
                << (compareFileSha256(filenameToSaveAs,
@@ -280,6 +278,8 @@ public:
                        ? "Succeeded"
                        : "Failed")
                << " -> " << ackPacket.data << endl;
+          sendAck(sequence);
+          sequence++;
           break;
         }
       } else {
@@ -287,9 +287,94 @@ public:
       }
     }
 
+    finHandshake();
+
     // Close socket
     closeSocket();
     return;
+  }
+
+  void finHandshake() {
+    TransfererHeader header;
+
+    for (int i = 0; i <= 100 && receiveFin(header); i++) {
+      sleep_for(chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
+
+      if (i == 100) {
+        cout << "timeout: server stopped responding.\n" << endl;
+        exit(-1);
+      }
+    }
+
+    sendFinAck(header);
+    int ret = waitForPacketOrTimeout();
+
+    if (ret < 0) {
+      cout << "timeout: server stopped responding.\n" << endl;
+      exit(-1);
+    }
+
+    receiveFinAck(header);
+  }
+
+  int receiveFin(TransfererHeader &header) {
+    ssize_t bytesReceived = sockReceive(header);
+
+    if (bytesReceived <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
+    }
+
+    if (header.flags != TransferFlags::FIN) {
+      cout << "FIN handshake failed\n";
+      return -2;
+    }
+
+    return 0;
+  }
+
+  void sendFin(TransfererHeader &header) {
+    TransfererHeader packet{.sequence = static_cast<uint32_t>(rand() % 100),
+                            .ackNumber = 0,
+                            .dataSize = 0,
+                            .flags = TransferFlags::FIN,
+                            .data = ""};
+
+    sockSend(packet);
+    packetBuff = packet;
+  }
+
+  void sendFinAck(TransfererHeader &header) {
+    TransfererHeader packet{.sequence = static_cast<uint32_t>(rand() % 100),
+                            .ackNumber = header.sequence + 1,
+                            .dataSize = 0,
+                            .flags = FIN & ACK,
+                            .data = ""};
+
+    sockSend(packet);
+    packetBuff = packet;
+  }
+
+  int receiveFinAck(TransfererHeader &header) {
+    ssize_t bytesReceived = sockReceive(header);
+
+    if (bytesReceived <= 0) {
+      cout << "Failed to peek\n";
+      return -1;
+    }
+
+    if (header.flags != (TransferFlags::ACK & TransferFlags::FIN) ||
+        header.ackNumber != packetBuff.sequence + 1) {
+      cout << "FIN handshake failed\n";
+      return -2;
+    }
+
+    if (sockReceive(header) <= 0) {
+      cout << "Failed to receive\n";
+      return -1;
+    }
+
+    return 0;
   }
 
   void closeSocket() {
@@ -339,7 +424,7 @@ public:
 
     sendSyn();
 
-    int ret = waitForEstabOrTimeout();
+    int ret = waitForPacketOrTimeout();
 
     if (ret < 0) {
       return ret;
@@ -380,7 +465,7 @@ public:
     return 0;
   }
 
-  int waitForEstabOrTimeout() {
+  int waitForPacketOrTimeout() {
     int ret = poll(&pfd, 1, TIMEOUT_MS);
 
     int timeouts = 0;
@@ -435,6 +520,7 @@ public:
 };
 
 int main(int argc, char **argv) {
+  srand(time(nullptr));
   Client client(argc, argv);
   return 0;
 }
