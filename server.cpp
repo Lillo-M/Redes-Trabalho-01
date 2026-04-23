@@ -37,7 +37,7 @@ using namespace std;
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define PAYLOAD_SIZE 536
 
-#define WINDOW_SIZE 100
+#define WINDOW_SIZE 512
 
 enum TransferFlags {
   ACK = (1 << 0),
@@ -128,7 +128,6 @@ public:
     finHandshake();
     TransfererHeader header;
     sockReceive(header);
-    printf("%d, %d, %d, %d\n", header.ackNumber, header.sequence, header.dataSize, header.flags);
 
     // closing the socket.
     closeSocket();
@@ -679,7 +678,8 @@ public:
     vector<unsigned char> buffer(PAYLOAD_SIZE);
     TransfererHeader packet;
 
-    for (int i = 0; i < cwnd && fileSize > 0; i++) {
+    for (int i = 0;
+         i < cwnd && fileSize > 0 && nackedPacketsCount < WINDOW_SIZE; i++) {
 
       int bytesRead = readFileChunk(buffer);
       fileSize -= bytesRead;
