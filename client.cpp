@@ -190,12 +190,10 @@ public:
     } while (ret == 0);
   }
 
-  void askRetrasmition(int sequence) {
+  void askRetransmition(int sequence) {
+    std::printf("Asking retransmit of seq %u\n", sequence - 1);
     TransfererHeader ack{0};
-    ack.sequence = sequence - 1;
-    ack.ackNumber = sequence - 1;
-    ack.flags = TransferFlags::ACK;
-    sockSend(ack);
+    sendAck(sequence - 1);
   }
 
   void sendAck(int sequence) {
@@ -261,6 +259,7 @@ public:
       TransfererHeader ackPacket;
       int n = recvfrom(serverSocket, &ackPacket, sizeof(ackPacket), MSG_WAITALL,
                        (struct sockaddr *)&serverAddress, &len);
+
       if (rand() % 100 < losePacketChance)
         continue;
 
@@ -282,8 +281,9 @@ public:
           sequence++;
           break;
         }
-      } else {
-        askRetrasmition(sequence);
+      } else if (n > 0 && ackPacket.sequence > sequence) {
+        std::printf("...%u|%u\n", ackPacket.sequence, sequence);
+        askRetransmition(sequence);
       }
     }
 
@@ -306,7 +306,12 @@ public:
       }
     }
 
+    printf("headerfin: %u %u %u\n", header.flags, header.ackNumber,
+           header.sequence);
+
     sendFinAck(header);
+    printf("headerfinack: %u %u %u\n", packetBuff.flags, packetBuff.ackNumber,
+           packetBuff.sequence);
     int ret = waitForPacketOrTimeout();
 
     if (ret < 0) {
@@ -348,7 +353,7 @@ public:
     TransfererHeader packet{.sequence = static_cast<uint32_t>(rand() % 100),
                             .ackNumber = header.sequence + 1,
                             .dataSize = 0,
-                            .flags = FIN & ACK,
+                            .flags = FIN | ACK,
                             .data = ""};
 
     sockSend(packet);
@@ -356,7 +361,7 @@ public:
   }
 
   int receiveFinAck(TransfererHeader &header) {
-    ssize_t bytesReceived = sockReceive(header);
+    ssize_t bytesReceived = sockPeek(header);
 
     if (bytesReceived <= 0) {
       cout << "Failed to peek\n";
@@ -466,14 +471,13 @@ public:
   }
 
   int waitForPacketOrTimeout() {
-    int ret = poll(&pfd, 1, TIMEOUT_MS);
-
     int timeouts = 0;
-    while (timeouts < 10000) {
-      ret = poll(&pfd, 1, TIMEOUT_MS);
+    while (timeouts < 3) {
+      int ret = poll(&pfd, 1, TIMEOUT_MS);
       if (ret > 0) {
         return 0;
       }
+
       sleep_for(std::chrono::milliseconds(WAIT_RESPONSE_TIMEOUT_MS));
       timeouts++;
       sockSend(packetBuff);
@@ -489,6 +493,11 @@ public:
                             .data = ""};
     sockSend(packet);
     packetBuff = packet;
+  }
+
+  ssize_t sockPeek(TransfererHeader &header) {
+    return recvfrom(serverSocket, &header, sizeof(header), MSG_PEEK,
+                    (sockaddr *)&serverAddress, &len);
   }
 
   ssize_t sockReceive(TransfererHeader &packet) {

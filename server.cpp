@@ -2,6 +2,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <regex>
 #include <signal.h>
 #include <string>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -28,6 +30,7 @@
 using std::this_thread::sleep_for;
 
 using namespace std;
+using namespace std::chrono;
 
 #define PORT 8080
 #define FAIL -1
@@ -82,7 +85,8 @@ public:
   int serverSocket = -1;
   sockaddr_in clientAddress{};
   ifstream file = ifstream();
-  deque<TransfererHeader> nackedPacketsBuffer = deque<TransfererHeader>();
+  deque<TransfererHeader> nackedPacketsBuffer =
+      deque<TransfererHeader>(WINDOW_SIZE);
   int nackedPacketsCount = 0;
   string ipv4 = "";
   PacketTimer packetTimer;
@@ -93,6 +97,9 @@ public:
   static State state;
   static Server *instance;
   struct itimerval timer{0};
+  steady_clock::time_point rttBegin = steady_clock::now();
+  uint32_t measuringSeq = -1;
+  bool measuring = false;
 
   Server() {
     if (!instance) {
@@ -125,8 +132,14 @@ public:
 
     handleRequest(request);
 
-    finHandshake();
     TransfererHeader header;
+    int ret = poll(&pfd, 1, TIMEOUT_MS);
+    while (ret > 0) {
+      sockReceive(header);
+      ret = poll(&pfd, 1, TIMEOUT_MS);
+    }
+
+    finHandshake();
     sockReceive(header);
 
     // closing the socket.
@@ -387,28 +400,33 @@ public:
                             .flags = TransferFlags::FIN,
                             .data = ""};
 
+    printf("packet: %u %u %u\n", packet.flags, packet.ackNumber,
+           packet.sequence);
+
     sendPacket(packet);
     initTimeout(packet.sequence);
   }
 
   int receiveFinAck(TransfererHeader &header) {
-    ssize_t bytesReceived = sockPeek(header);
+    ssize_t bytesReceived = sockReceive(header);
 
     if (bytesReceived <= 0) {
-      cout << "Failed to peek\n";
+      cout << "Failed to receive\n";
       return -1;
     }
 
-    if (header.flags != (TransferFlags::ACK & TransferFlags::FIN) ||
+    while (header.flags == ACK) {
+      ssize_t bytesReceived = sockReceive(header);
+    }
+
+    printf("header: %u %u %u\n", header.flags, header.ackNumber,
+           packetTimer.packetSequence);
+    if (header.flags != (TransferFlags::ACK | TransferFlags::FIN) ||
         header.ackNumber != packetTimer.packetSequence + 1) {
       cout << "FIN handshake failed\n";
       return -2;
     }
 
-    if (sockReceive(header) <= 0) {
-      cout << "Failed to receive\n";
-      return -1;
-    }
     return 0;
   }
 
@@ -462,6 +480,8 @@ public:
         return -2;
       }
     } while (ret == -2);
+    nackedPacketsBuffer.pop_front();
+    nackedPacketsCount--;
     return ret;
   }
 
@@ -532,7 +552,7 @@ public:
     return string(packet.data);
   }
 
-  void setTimeout(bool hasTimedOut) {
+  void setTimeout(bool hasTimedOut, uint32_t sampleRTT = 0) {
     float alpha = 1.f / 8;
     float beta = 1.f / 4;
 
@@ -541,38 +561,44 @@ public:
       perror("Error calling getitimer()");
       exit(1);
     }
-    time_t timeLeft = (curr_value.it_value.tv_sec * 1000 +
-                       curr_value.it_value.tv_usec / 1000);
 
-    static time_t EstimatedRTT = 500 * 4 / 3, DevRTT = 0, lastTimeoutLen = 0;
-    time_t SampleRTT = lastTimeoutLen - timeLeft;
-
-    if (hasTimedOut) {
-      EstimatedRTT *= 2;
+    static uint32_t lastSample = 500;
+    if (sampleRTT == 0) {
+      sampleRTT = lastSample;
+    } else {
+      lastSample = sampleRTT;
     }
 
-    EstimatedRTT = (1 - alpha) * EstimatedRTT + alpha * SampleRTT;
+    static time_t estimatedRTT = 500 * 4 / 3, devRTT = 0, lastTimeoutLen = 0;
 
-    DevRTT = (1 - beta) * DevRTT + beta * abs(SampleRTT - EstimatedRTT);
+    if (hasTimedOut) {
+      estimatedRTT *= 2;
+    }
 
-    lastTimeoutLen = (EstimatedRTT + 4 * DevRTT);
+    estimatedRTT = (1 - alpha) * estimatedRTT + alpha * sampleRTT;
+
+    devRTT = (1 - beta) * devRTT + beta * abs(sampleRTT - estimatedRTT);
+
+    lastTimeoutLen = (estimatedRTT + 4 * devRTT);
+
+    if (lastTimeoutLen > 1000) {
+      lastTimeoutLen = 999;
+    }
 
     setTimer(lastTimeoutLen * 1000);
     startTimer();
   }
 
   void acknowledgePacket(TransfererHeader &header) {
-    setTimeout(false);
-
     switch (state) {
     case SlowStart:
-      cwnd *= 2;
+      cwnd += 1;
       break;
     case CongestionAvoidance:
-      cwnd = cwnd + PAYLOAD_SIZE * PAYLOAD_SIZE / cwnd;
+      cwnd = cwnd + PAYLOAD_SIZE / cwnd;
       break;
     case FastRecovery:
-      cwnd = ssthresh;
+      cwnd = ssthresh + 1;
       avoidCongestion();
       break;
     }
@@ -584,9 +610,18 @@ public:
       nackedPacketsBuffer.pop_front();
       nackedPacketsCount--;
     }
+
     if (cwnd >= ssthresh) {
       avoidCongestion();
     }
+
+    if (measuring == true && measuringSeq == header.sequence) {
+      steady_clock::time_point rttEnd = steady_clock::now();
+
+      size_t rtt = duration_cast<milliseconds>(rttEnd - rttBegin).count();
+      setTimeout(false, rtt);
+    }
+    setTimeout(false);
   }
 
   void pollAcks(int sequence) {
@@ -598,25 +633,28 @@ public:
     static int lastAck = -1;
     static int AckDupCount = 0;
 
-    int i;
-    for (i = 0; i < 100 && ret == 0; i++) {
-      ret = poll(&pfd, 1, TIMEOUT_MS);
-    }
-    if (100 == i) {
+    if (nackedPacketsCount <= 0)
       return;
+
+    while (ret <= 0) {
+      ret = poll(&pfd, 1, TIMEOUT_MS);
     }
 
     while (ret > 0) {
+      ret = poll(&pfd, 1, TIMEOUT_MS);
       bytesReceived = sockReceive(header);
+      printf("Received %u\n", header.ackNumber);
 
       if (header.flags == TransferFlags::ACK) {
         if (lastAck == header.ackNumber) {
           AckDupCount++;
 
-          if (AckDupCount == 3) {
+          if (AckDupCount >= 3) {
             tripleAcks(header.ackNumber);
             return;
           }
+
+          doubleAcks(header.ackNumber);
 
           continue;
         }
@@ -625,12 +663,25 @@ public:
         lastAck = header.ackNumber;
         acknowledgePacket(header);
       }
-
       ret = poll(&pfd, 1, TIMEOUT_MS);
     }
   }
 
-  void tripleAcks(int ackNumber) {
+  void doubleAcks(int ackNumber) {
+    switch (state) {
+    case SlowStart:
+      break;
+    case CongestionAvoidance:
+      break;
+    case FastRecovery:
+      cwnd += 1;
+      fastRecover(ackNumber);
+      break;
+    }
+  }
+
+  void tripleAcks(uint32_t ackNumber) {
+    printf("Triple Ack\n");
     switch (state) {
     case SlowStart:
     case CongestionAvoidance:
@@ -644,18 +695,18 @@ public:
       fastRecover(ackNumber);
       break;
     }
+    resetNackedWindow(ackNumber);
   }
 
-  void fastRecover(int ackNumber) {}
+  void fastRecover(uint32_t ackNumber) {}
 
   void avoidCongestion() { state = CongestionAvoidance; }
 
   bool windowIsFull() { return nackedPacketsCount >= WINDOW_SIZE; }
 
   void timedOut() {
-    assert(nackedPacketsCount > 0);
-    setTimeout(true);
-    sockSend(nackedPacketsBuffer.front());
+    if (nackedPacketsCount > 0 && windowIsFull())
+      resetNackedWindow(nackedPacketsBuffer.front().sequence - 1);
   }
   void resendAllNackedPackets() {
     for (TransfererHeader &nacked : nackedPacketsBuffer) {
@@ -674,12 +725,19 @@ public:
     resendAllNackedPackets();
   }
 
+  void measureRTT(int sequence) {
+    if (measuring == false) {
+      rttBegin = steady_clock::now();
+      measuring = true;
+      measuringSeq = sequence;
+    }
+  }
+
   void sendPacketWindow(int &sequence) {
     vector<unsigned char> buffer(PAYLOAD_SIZE);
     TransfererHeader packet;
 
-    for (int i = 0;
-         i < cwnd && fileSize > 0 && nackedPacketsCount < WINDOW_SIZE; i++) {
+    for (int i = 0; i < cwnd && fileSize > 0 && !windowIsFull(); i++) {
 
       int bytesRead = readFileChunk(buffer);
       fileSize -= bytesRead;
@@ -695,20 +753,33 @@ public:
 
       packet = createPacket(buffer, bytesRead, sequence, DATA);
       sendPacket(packet);
+
+      measureRTT(sequence);
+
+      printf("Packet sended, seq `%u`\n", sequence);
+
       sequence++;
     }
   }
 
+  void resetNackedWindow(uint32_t ackNumber) {
+    nackedPacketsBuffer.clear();
+    file.seekg((ackNumber + 1) * PAYLOAD_SIZE, ios::beg);
+    fileSize += (ackNumber + 1) * PAYLOAD_SIZE;
+    sequenceNumber = ackNumber;
+    nackedPacketsCount = 0;
+  }
+
+  int sequenceNumber = 0;
   void streamFile(const string checksum) {
-    int sequence = 0;
 
     while (fileSize > 0) {
-      sendPacketWindow(sequence);
-      pollAcks(sequence);
+      sendPacketWindow(sequenceNumber);
+      pollAcks(sequenceNumber);
     }
 
     TransfererHeader packet{0};
-    packet.sequence = sequence;
+    packet.sequence = sequenceNumber;
     packet.flags = FIN | DATA;
     memccpy(packet.data, checksum.c_str(), 0, checksum.size());
     packet.data[checksum.size()] = 0;
@@ -717,8 +788,9 @@ public:
 
     nackedPacketsBuffer.push_back(packet);
     nackedPacketsCount++;
+
     while (nackedPacketsCount > 0) {
-      pollAcks(sequence);
+      pollAcks(sequenceNumber);
     }
   }
 
