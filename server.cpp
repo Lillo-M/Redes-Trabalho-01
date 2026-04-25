@@ -91,6 +91,7 @@ public:
   string ipv4 = "";
   PacketTimer packetTimer;
   int clientKeepAliveTimeout;
+  uint32_t fileRemaining = 0;
   uint32_t fileSize = 0;
   static uint32_t cwnd;
   static uint32_t ssthresh;
@@ -187,9 +188,21 @@ public:
   static void timeoutHandler(int signum) {
     state = SlowStart;
     ssthresh = cwnd / 2;
-    cwnd = 1;
+    setCwnd(1);
     instance->timedOut();
     printf("Timeout: State changed to Slow Start | signum '%d'\n", signum);
+  }
+
+  static void setCwnd(uint32_t value) {
+    if (value > WINDOW_SIZE) {
+      cwnd = WINDOW_SIZE;
+      return;
+    }
+    if (value <= 0U) {
+      cwnd = 1;
+      return;
+    }
+    cwnd = value;
   }
 
   void startTimer() {
@@ -234,7 +247,8 @@ public:
   void openFile(const std::string &filename) {
     file.open(filename, ios::binary);
     file.seekg(0, ios::end);
-    fileSize = file.tellg();
+    fileRemaining = file.tellg();
+    fileSize = fileRemaining;
     file.seekg(0);
     file.clear();
   }
@@ -260,7 +274,7 @@ public:
   TransfererHeader createPacket(vector<unsigned char> &data, int dataSize,
                                 uint32_t sequence, uint8_t flags) {
     TransfererHeader packet;
-    memccpy(packet.data, data.data(), 0, dataSize);
+    memcpy(packet.data, data.data(), dataSize);
 
     packet.dataSize = dataSize;
     packet.sequence = sequence;
@@ -592,13 +606,13 @@ public:
   void acknowledgePacket(TransfererHeader &header) {
     switch (state) {
     case SlowStart:
-      cwnd += 1;
+      setCwnd(cwnd + 1);
       break;
     case CongestionAvoidance:
-      cwnd = cwnd + PAYLOAD_SIZE / cwnd;
+      setCwnd(cwnd + PAYLOAD_SIZE / cwnd);
       break;
     case FastRecovery:
-      cwnd = ssthresh + 1;
+      setCwnd(ssthresh + 1);
       avoidCongestion();
       break;
     }
@@ -622,6 +636,7 @@ public:
       setTimeout(false, rtt);
     }
     setTimeout(false);
+    measuringSeq = header.sequence + 1;
   }
 
   void pollAcks(int sequence) {
@@ -686,7 +701,7 @@ public:
     case SlowStart:
     case CongestionAvoidance:
       ssthresh = cwnd / 2;
-      cwnd = ssthresh + 3;
+      setCwnd(ssthresh + 3);
       fastRecover(ackNumber);
       state = FastRecovery;
       break;
@@ -706,7 +721,7 @@ public:
 
   void timedOut() {
     if (nackedPacketsCount > 0 && windowIsFull())
-      resetNackedWindow(nackedPacketsBuffer.front().sequence - 1);
+      resetNackedWindow(measuringSeq);
   }
   void resendAllNackedPackets() {
     for (TransfererHeader &nacked : nackedPacketsBuffer) {
@@ -733,21 +748,24 @@ public:
     }
   }
 
+  int getRemainingCwnd() { return WINDOW_SIZE - nackedPacketsCount; }
+
   void sendPacketWindow(int &sequence) {
     vector<unsigned char> buffer(PAYLOAD_SIZE);
     TransfererHeader packet;
 
-    for (int i = 0; i < cwnd && fileSize > 0 && !windowIsFull(); i++) {
+    int window = getRemainingCwnd();
+    for (int i = 0; i < window && fileRemaining > 0 && !windowIsFull(); i++) {
 
       int bytesRead = readFileChunk(buffer);
-      fileSize -= bytesRead;
+      fileRemaining -= bytesRead;
 
       if (bytesRead < 0) {
         cout << "failed to stream file: file not opened\n";
         exit(-1);
       }
 
-      if (bytesRead <= 0 && fileSize <= 0) {
+      if (bytesRead <= 0 && fileRemaining <= 0) {
         return;
       }
 
@@ -764,16 +782,20 @@ public:
 
   void resetNackedWindow(uint32_t ackNumber) {
     nackedPacketsBuffer.clear();
-    file.seekg((ackNumber + 1) * PAYLOAD_SIZE, ios::beg);
-    fileSize += (ackNumber + 1) * PAYLOAD_SIZE;
+
     sequenceNumber = ackNumber;
+
+    file.seekg(sequenceNumber * PAYLOAD_SIZE, ios::beg);
+
+    fileRemaining = fileSize - sequenceNumber * PAYLOAD_SIZE;
+
     nackedPacketsCount = 0;
   }
 
   int sequenceNumber = 0;
   void streamFile(const string checksum) {
 
-    while (fileSize > 0) {
+    while (fileRemaining > 0 || nackedPacketsCount > 0) {
       sendPacketWindow(sequenceNumber);
       pollAcks(sequenceNumber);
     }
@@ -791,6 +813,7 @@ public:
 
     while (nackedPacketsCount > 0) {
       pollAcks(sequenceNumber);
+      setTimeout(false);
     }
   }
 
