@@ -1,11 +1,15 @@
 #include <arpa/inet.h>
 #include <bits/stdc++.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <iostream>
+#include <iterator>
 #include <netinet/in.h>
 #include <ostream>
+#include <set>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/poll.h>
@@ -25,14 +29,15 @@ using namespace std;
 #define WAIT_RESPONSE_TIMEOUT_MS 500
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
-#define MAXLINE 1024
-#define RECEIVE_BUFFER_SIZE 1024 * 1024
+#define PAYLOAD_SIZE 536
+#define RECEIVE_BUFFER_SIZE 640 * 110000
 
 enum TransferFlags {
   ACK = (1 << 0),
   DATA = (1 << 1),
   FIN = (1 << 2),
   SYN = (1 << 3),
+  SR = (1 << 4),
 };
 
 typedef struct TransfererHeader {
@@ -41,7 +46,10 @@ typedef struct TransfererHeader {
   uint16_t dataSize;
   uint16_t rwnd;
   uint8_t flags;
-  char data[1024];
+  char data[PAYLOAD_SIZE];
+  bool operator<(const TransfererHeader &right) const {
+    return this->sequence < right.sequence;
+  }
 } TransfererHeader;
 
 typedef struct PacketTimer {
@@ -140,6 +148,7 @@ public:
   PacketTimer packetTimer;
   pollfd pfd{};
   TransfererHeader packetBuff{};
+  set<TransfererHeader> outOfOrderPackets = set<TransfererHeader>();
 
   void createSocket() {
     serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
@@ -190,17 +199,19 @@ public:
     } while (ret == 0);
   }
 
-  void askRetransmition(int sequence) {
+  void askRetransmition(uint32_t sequence) {
     std::printf("Asking retransmit of seq %u\n", sequence - 1);
-    TransfererHeader ack{0};
     sendAck(sequence - 1);
   }
 
-  void sendAck(int sequence) {
+  void sendAck(uint32_t sequence) {
     TransfererHeader ack{0};
     ack.sequence = sequence;
     ack.ackNumber = sequence;
     ack.flags = TransferFlags::ACK;
+#ifdef SELECTIVE_REPEAT
+    ack.flags |= SR;
+#endif
     sockSend(ack);
   }
 
@@ -237,13 +248,11 @@ public:
       exit(EXIT_FAILURE);
     }
 
-    memccpy(packetBuff.data, request.c_str(), 0, 1023);
+    memccpy(packetBuff.data, request.c_str(), 0, PAYLOAD_SIZE);
 
     sendRequest();
 
-    TransfererHeader ack{0};
-
-    int sequence = 0;
+    uint32_t sequence = 0;
 
     FileWriter fileWriter;
 
@@ -265,10 +274,31 @@ public:
 
       if (ackPacket.sequence == sequence) {
         if (ackPacket.flags == TransferFlags::DATA) {
-          printf("Sequence: %d\n", ackPacket.sequence);
+          printf("Sequence: %u\n", ackPacket.sequence);
           fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
           sendAck(sequence);
           sequence++;
+
+#ifdef SELECTIVE_REPEAT
+
+          int count = 0;
+          for (auto &packet : outOfOrderPackets) {
+            if (sequence != packet.sequence) {
+              break;
+            }
+            printf("OOO - Sequence: %d\n", packet.sequence);
+            fileWriter.writeBuffer(packet.data, packet.dataSize);
+            sendAck(sequence);
+            sequence++;
+            count++;
+          }
+          sendAck(sequence - 1);
+          auto first = outOfOrderPackets.begin();
+          auto last = std::next(first, count);
+          outOfOrderPackets.erase(first, last);
+
+#endif
+
         } else if (ackPacket.flags & (FIN | DATA)) {
           fileWriter.closeFile();
           cout << "Server: Transmition ended checksum "
@@ -281,8 +311,15 @@ public:
           sequence++;
           break;
         }
-      } else if (n > 0 && ackPacket.sequence > sequence) {
+      } else if (n > 0 && ackPacket.flags & DATA) {
         std::printf("...%u|%u\n", ackPacket.sequence, sequence);
+
+#ifdef SELECTIVE_REPEAT
+        if (ackPacket.flags == TransferFlags::DATA &&
+            ackPacket.sequence > sequence) {
+          outOfOrderPackets.insert(ackPacket);
+        }
+#endif
         askRetransmition(sequence);
       }
     }
