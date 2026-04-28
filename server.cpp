@@ -14,7 +14,6 @@
 #include <fstream>
 #include <iostream>
 #include <netinet/in.h>
-#include <numeric>
 #include <ostream>
 #include <poll.h>
 #include <pthread.h>
@@ -53,6 +52,7 @@ enum TransferFlags {
   FIN = (1 << 2),
   SYN = (1 << 3),
   SR = (1 << 4),
+  ERROR = 0xFF
 };
 
 enum State { SlowStart, CongestionAvoidance, FastRecovery };
@@ -370,6 +370,14 @@ public:
     return result.substr(0, space);
   }
 
+  void sendError(string &response) {
+    TransfererHeader packet;
+    packet.sequence = 0;
+    packet.flags = 255;
+    memccpy(packet.data, response.c_str(), 0, response.size());
+    packet.dataSize = response.size();
+    sockSend(packet);
+  }
   void handleRequest(string &request) {
     string response;
     if (string::npos == request.find("GET")) {
@@ -384,8 +392,9 @@ public:
         request.substr(indexAfterGetAndWhitespace, request.length());
 
     if (!fileExistsInRoot(filename)) {
-      response = "Seu GET é uma merda\n";
+      response = "file not found\n";
       cout << response << endl;
+      sendError(response);
       return;
     }
 

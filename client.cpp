@@ -6,7 +6,6 @@
 #include <ctime>
 #include <filesystem>
 #include <iostream>
-#include <iterator>
 #include <netinet/in.h>
 #include <ostream>
 #include <set>
@@ -30,7 +29,8 @@ using namespace std;
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define PAYLOAD_SIZE 536
-#define RECEIVE_BUFFER_SIZE 640 * 110000
+#define SIZE_OF_PACKET (8 + sizeof(TransfererHeader))
+#define RECEIVE_BUFFER_SIZE (1 << 16) * SIZE_OF_PACKET
 
 enum TransferFlags {
   ACK = (1 << 0),
@@ -38,6 +38,7 @@ enum TransferFlags {
   FIN = (1 << 2),
   SYN = (1 << 3),
   SR = (1 << 4),
+  ERROR = 0xFF,
 };
 
 typedef struct TransfererHeader {
@@ -176,7 +177,7 @@ public:
   }
 
   void setSocketReceiveBufferSize(const int receiveBufferSize) {
-    setsockopt(serverSocket, SOL_SOCKET, SO_SNDBUF, &receiveBufferSize,
+    setsockopt(serverSocket, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize,
                sizeof(receiveBufferSize));
   }
 
@@ -216,6 +217,8 @@ public:
   }
 
   Client(int argc, char **argv) {
+
+    cout << "Sizeof packet " << sizeof(TransfererHeader) << "\n";
     if (argc < 2) {
       cout << "Insert server ip address: ";
       getline(cin, ipv4);
@@ -272,7 +275,7 @@ public:
       if (rand() % 100 < losePacketChance)
         continue;
 
-      if (ackPacket.sequence == sequence) {
+      if (ackPacket.sequence == sequence && ackPacket.flags != ERROR) {
         if (ackPacket.flags == TransferFlags::DATA) {
           printf("Sequence: %u\n", ackPacket.sequence);
           fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
@@ -301,7 +304,8 @@ public:
 
         } else if (ackPacket.flags & (FIN | DATA)) {
           fileWriter.closeFile();
-          cout << "Server: Transmition ended checksum "
+          cout << "Server: Transmition ended\n"
+               << "checksum "
                << (compareFileSha256(filenameToSaveAs,
                                      string((char *)ackPacket.data))
                        ? "Succeeded"
@@ -311,7 +315,7 @@ public:
           sequence++;
           break;
         }
-      } else if (n > 0 && ackPacket.flags & DATA) {
+      } else if (n > 0 && ackPacket.flags & DATA && ackPacket.flags != ERROR) {
         std::printf("...%u|%u\n", ackPacket.sequence, sequence);
 
 #ifdef SELECTIVE_REPEAT
@@ -320,7 +324,13 @@ public:
           outOfOrderPackets.insert(ackPacket);
         }
 #endif
+
         askRetransmition(sequence);
+      } else if (ackPacket.flags == ERROR) {
+        cout << "Bad request: ";
+        fwrite(ackPacket.data, 1, ackPacket.dataSize, stdout);
+        cout << "\n";
+        break;
       }
     }
 
