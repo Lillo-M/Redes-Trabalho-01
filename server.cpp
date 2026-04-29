@@ -1,5 +1,4 @@
 #include <arpa/inet.h>
-#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -12,13 +11,17 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <netinet/in.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <ostream>
 #include <poll.h>
 #include <pthread.h>
 #include <regex>
 #include <signal.h>
+#include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -44,7 +47,7 @@ using namespace std::chrono;
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define PAYLOAD_SIZE 536
 
-#define WINDOW_SIZE 1512U
+#define WINDOW_SIZE ((unsigned int)(1 << 14))
 
 enum TransferFlags {
   ACK = (1 << 0),
@@ -61,10 +64,10 @@ typedef struct TransfererHeader {
   uint32_t sequence;
   uint32_t ackNumber;
   uint16_t dataSize;
-  uint16_t rwnd;
+  uint8_t checksum;
   uint8_t flags;
   char data[PAYLOAD_SIZE];
-  bool operator<(const TransfererHeader &right) {
+  bool operator<(const TransfererHeader &right) const {
     return this->sequence < right.sequence;
   }
 } TransfererHeader;
@@ -245,7 +248,7 @@ public:
     state = SlowStart;
     ssthresh = cwnd / 2;
     setCwnd(1);
-    instance->timedOut();
+    instance->tOut = true;
     printf("Timeout: State changed to Slow Start | signum '%d'\n", signum);
   }
 
@@ -316,14 +319,14 @@ public:
    * return 0 when read less or equal zero bytes;
    * return -1 when file is null;
    * */
-  int readFileChunk(vector<unsigned char> &buffer) {
+  int readFileChunk(char *buffer, int size) {
     if (!file.is_open())
       return -1;
 
     if (file.fail()) {
       cout << "Failed: " << file.fail() << endl;
     }
-    file.read(reinterpret_cast<char *>(buffer.data()), buffer.size());
+    file.read(buffer, size);
 
     std::streamsize bytesRead = file.gcount();
 
@@ -335,39 +338,85 @@ public:
     return bytesRead;
   }
 
-  TransfererHeader createPacket(vector<unsigned char> &data, int dataSize,
-                                uint32_t sequence, uint8_t flags) {
+  uint8_t calculateChecksum(uint8_t *data, int size) {
+    uint8_t crc = 0x00;
+
+    for (size_t i = 0; i < size; i++) {
+      crc ^= data[i];
+
+      for (int j = 0; j < 8; j++) {
+        if (crc & 0x80)
+          crc = (crc << 1) ^ 0x07;
+        else
+          crc <<= 1;
+      }
+    }
+
+    return crc;
+  }
+
+  TransfererHeader createPacket(char *data, int dataSize, uint32_t sequence,
+                                uint8_t flags) {
     TransfererHeader packet;
-    memcpy(packet.data, data.data(), dataSize);
+    memcpy(packet.data, data, dataSize);
 
     packet.dataSize = dataSize;
     packet.sequence = sequence;
     packet.ackNumber = sequence;
     packet.flags = flags;
+    packet.checksum = calculateChecksum((uint8_t *)data, dataSize);
 
     return packet;
   }
 
-  std::string sha256File(const std::string &filename) {
-    std::string command = "sha256sum \"" + filename + "\"";
+  string sha256File(const std::string &file_path) {
+    ifstream file(file_path, std::ios::binary);
+    if (!file) {
+      throw runtime_error("Cannot open file: " + file_path);
+    }
 
-    std::array<char, 128> buffer;
-    std::string result;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+      throw runtime_error("Failed to create EVP context");
+    }
 
-    FILE *pipe = popen(command.c_str(), "r");
-    if (!pipe)
-      return "";
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+      EVP_MD_CTX_free(ctx);
+      throw runtime_error("Digest init failed");
+    }
 
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
-      result += buffer.data();
+    char buffer[8192];
 
-    pclose(pipe);
+    while (file.good()) {
+      file.read(buffer, sizeof(buffer));
+      streamsize bytes_read = file.gcount();
 
-    size_t space = result.find(' ');
-    if (space == std::string::npos)
-      return "";
+      if (bytes_read > 0) {
+        if (EVP_DigestUpdate(ctx, buffer, bytes_read) != 1) {
+          EVP_MD_CTX_free(ctx);
+          throw runtime_error("Digest update failed");
+        }
+      }
+    }
 
-    return result.substr(0, space);
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1) {
+      EVP_MD_CTX_free(ctx);
+      throw runtime_error("Digest final failed");
+    }
+
+    EVP_MD_CTX_free(ctx);
+
+    ostringstream result;
+    result << hex << setfill('0');
+
+    for (unsigned int i = 0; i < hash_len; i++) {
+      result << setw(2) << static_cast<int>(hash[i]);
+    }
+
+    return result.str();
   }
 
   void sendError(string &response) {
@@ -680,7 +729,7 @@ public:
 
     int tries = 0;
     int ret = tryThreeWayHandshake();
-    while (ret != 0 && tries < 100) {
+    while (ret != 0 && tries < 2) {
       sleep_for(milliseconds(1));
       tries++;
       ret = tryThreeWayHandshake();
@@ -727,8 +776,10 @@ public:
     static time_t estimatedRTT = 0, devRTT = 0, lastTimeoutLen = 0;
 
     if (sampleRTT == 0) {
-      if (hasTimedOut)
+      if (hasTimedOut) {
         lastTimeoutLen *= 2;
+        lastTimeoutLen = lastTimeoutLen > 500 ? 500 : lastTimeoutLen;
+      }
       setTimer(lastTimeoutLen * 1000);
       startTimer();
       return;
@@ -740,43 +791,43 @@ public:
 
     lastTimeoutLen = (estimatedRTT + 4 * devRTT);
 
-    if (lastTimeoutLen > 1000) {
-      lastTimeoutLen = 999;
-    }
-
     setTimer(lastTimeoutLen * 1000);
     startTimer();
   }
 
   void acknowledgePacket(TransfererHeader &header) {
-    setTimeout();
     static uint32_t congCount = 0;
     switch (state) {
     case SlowStart:
       congCount = 0;
-      printf("SS\n");
       setCwnd(cwnd + 1);
       break;
     case CongestionAvoidance:
-      printf("CongAvoid\n");
       congCount++;
-      setCwnd(cwnd + congCount / cwnd);
+      setCwnd(cwnd + congCount / (4 * cwnd));
+      if (!(congCount % (4 * cwnd))) {
+        congCount = 0;
+      }
       break;
     case FastRecovery:
       congCount = 0;
-      printf("FastRec\n");
       setCwnd(ssthresh + 1);
       avoidCongestion();
       break;
     }
 
-    printf("Ack Received, cwnd `%u`\n", cwnd);
+    if (!nackedPacketsBuffer.empty() &&
+        header.ackNumber + 1 > sequenceNumber) {
+
+      resetNackedWindow(header.ackNumber);
+      discardPackets(); // drain stales from this wrong window
+      return;
+    }
 
     while (!nackedPacketsBuffer.empty() &&
            nackedPacketsBuffer.front().sequence <= header.sequence) {
       nackedPacketsBuffer.pop_front();
       nackedPacketsCount--;
-      setTimeout();
     }
 
     if (cwnd >= ssthresh) {
@@ -815,9 +866,47 @@ public:
     while (ret > 0) {
       sockReceive(header);
       ret = poll(&pfd, 1, TIMEOUT_MS);
-      printf("Received %u\n", header.ackNumber);
 
+      if (tOut) {
+        tOut = false;
+
+        // Drena ACKs pendentes para saber até onde o cliente realmente chegou
+        TransfererHeader ack;
+        while (poll(&pfd, 1, 0) > 0) {
+          sockReceive(ack);
+          if (ack.flags & ACK) {
+            // Remove pacotes já confirmados da janela
+            while (!nackedPacketsBuffer.empty() &&
+                   nackedPacketsBuffer.front().sequence <= ack.sequence) {
+              nackedPacketsBuffer.pop_front();
+              nackedPacketsCount--;
+            }
+          }
+        }
+
+        // Agora reseta a partir do estado real (atualizado pelos ACKs acima)
+        if (nackedPacketsCount > 0) {
+          resetNackedWindow(sequenceNumber - nackedPacketsCount - 1);
+        }
+
+        setTimeout(0, true);
+        return;
+      }
       if (header.flags & TransferFlags::ACK) {
+        if (!nackedPacketsBuffer.empty() &&
+            header.ackNumber + 1 < nackedPacketsBuffer.front().sequence) {
+          continue;
+        }
+
+
+    if (!nackedPacketsBuffer.empty() &&
+        header.ackNumber + 1 > sequenceNumber) {
+
+      resetNackedWindow(header.ackNumber);
+      discardPackets(); // drain stales from this wrong window
+      return;
+    }
+
         if ((nackedPacketsBuffer.empty() ||
              header.ackNumber + 1 == nackedPacketsBuffer.front().sequence) &&
             lastAck == header.ackNumber) {
@@ -826,6 +915,7 @@ public:
           if (AckDupCount >= 3) {
             tripleAcks(header.ackNumber, header.flags);
             AckDupCount = 0;
+            lastAck = UINT32_MAX;
             return;
           }
 
@@ -855,7 +945,6 @@ public:
   }
 
   void tripleAcks(uint32_t ackNumber, uint8_t flags) {
-    printf("Triple Ack\n");
     switch (state) {
     case SlowStart:
     case CongestionAvoidance:
@@ -873,7 +962,6 @@ public:
     if (flags & SR) {
       sockSend(nackedPacketsBuffer.front());
     } else {
-      cout << "reseting by tripleAcks\n";
       resetNackedWindow(ackNumber);
     }
   }
@@ -885,10 +973,7 @@ public:
   bool windowIsFull() { return (uint32_t)nackedPacketsCount >= WINDOW_SIZE; }
 
   void timedOut() {
-    cout << "timedOut ---------" << nackedPacketsCount << "\n";
     if (nackedPacketsCount > 0) {
-      cout << "reseting by timeout ---------"
-           << sequenceNumber - nackedPacketsCount - 1 << "\n";
       resetNackedWindow(sequenceNumber - nackedPacketsCount - 1);
     }
     tOut = true;
@@ -923,7 +1008,7 @@ public:
   uint32_t getRemainingCwnd() { return WINDOW_SIZE - nackedPacketsCount; }
 
   void sendPacketWindow(int &sequence) {
-    vector<unsigned char> buffer(PAYLOAD_SIZE);
+    char buffer[PAYLOAD_SIZE];
     TransfererHeader packet;
 
     uint32_t window = getRemainingCwnd();
@@ -932,7 +1017,7 @@ public:
     for (uint32_t i = 0; i < cwnd && fileRemaining > 0 && !windowIsFull();
          i++) {
 
-      int bytesRead = readFileChunk(buffer);
+      int bytesRead = readFileChunk(buffer, PAYLOAD_SIZE);
       fileRemaining -= bytesRead;
 
       if (bytesRead < 0) {
@@ -947,14 +1032,12 @@ public:
 
       packet = createPacket(buffer, bytesRead, sequence, DATA);
       sendPacket(packet);
-      printf("Packet sent seq `%u`\n", sequence);
 
       measureRTT(sequence);
 
       sequence++;
     }
 
-    printf("Packet sent up to seq `%u`\n", sequence);
     setTimeout();
   }
 
@@ -991,7 +1074,10 @@ public:
     packet.sequence = sequenceNumber;
     packet.flags = FIN | DATA;
     memccpy(packet.data, checksum.c_str(), 0, checksum.size());
+    packet.dataSize = checksum.size();
     packet.data[checksum.size()] = 0;
+    packet.checksum =
+        calculateChecksum((uint8_t *)checksum.c_str(), checksum.size());
 
     sockSend(packet);
 

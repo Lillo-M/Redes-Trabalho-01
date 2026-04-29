@@ -30,7 +30,7 @@ using namespace std;
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
 #define PAYLOAD_SIZE 536
 #define SIZE_OF_PACKET (8 + sizeof(TransfererHeader))
-#define RECEIVE_BUFFER_SIZE (1 << 16) * SIZE_OF_PACKET
+#define RECEIVE_BUFFER_SIZE (1 << 14) * SIZE_OF_PACKET
 
 enum TransferFlags {
   ACK = (1 << 0),
@@ -45,7 +45,7 @@ typedef struct TransfererHeader {
   uint32_t sequence;
   uint32_t ackNumber;
   uint16_t dataSize;
-  uint16_t rwnd;
+  uint8_t checksum;
   uint8_t flags;
   char data[PAYLOAD_SIZE];
   bool operator<(const TransfererHeader &right) const {
@@ -276,6 +276,14 @@ public:
         continue;
 
       if (ackPacket.sequence == sequence && ackPacket.flags != ERROR) {
+
+        if (ackPacket.checksum !=
+            calculateChecksum(ackPacket.data, ackPacket.dataSize)) {
+          if (sequence > 0) {
+            askRetransmition(sequence);
+          }
+          continue;
+        }
         if (ackPacket.flags == TransferFlags::DATA) {
           printf("Sequence: %u\n", ackPacket.sequence);
           fileWriter.writeBuffer(ackPacket.data, ackPacket.dataSize);
@@ -303,6 +311,11 @@ public:
 #endif
 
         } else if (ackPacket.flags & (FIN | DATA)) {
+          if (ackPacket.checksum !=
+              calculateChecksum(ackPacket.data, ackPacket.dataSize)) {
+            askRetransmition(sequence);
+            continue;
+          }
           fileWriter.closeFile();
           cout << "Server: Transmition ended\n"
                << "checksum "
@@ -325,7 +338,19 @@ public:
         }
 #endif
 
-        askRetransmition(sequence);
+        static int lesserCount = 0;
+        if (ackPacket.sequence >= sequence) {
+          lesserCount = 0;
+          discardStalePackets();
+          askRetransmition(sequence);
+        } else {
+          lesserCount++;
+          if (lesserCount >= 3) {
+            lesserCount = 0;
+            discardStalePackets();
+            askRetransmition(sequence);
+          }
+        }
       } else if (ackPacket.flags == ERROR) {
         cout << "Bad request: ";
         fwrite(ackPacket.data, 1, ackPacket.dataSize, stdout);
@@ -339,6 +364,15 @@ public:
     // Close socket
     closeSocket();
     return;
+  }
+
+  void discardStalePackets() {
+    TransfererHeader tmp;
+    // Drena tudo que está no buffer sem bloquear
+    while (poll(&pfd, 1, 0) > 0) {
+      recvfrom(serverSocket, &tmp, sizeof(tmp), 0,
+               (struct sockaddr *)&serverAddress, &len);
+    }
   }
 
   void finHandshake() {
@@ -572,6 +606,23 @@ public:
   void setupPollDescriptor() {
     pfd.fd = serverSocket;
     pfd.events = POLLIN;
+  }
+
+  uint8_t calculateChecksum(char *data, int size) {
+    uint8_t crc = 0x00;
+
+    for (size_t i = 0; i < size; i++) {
+      crc ^= data[i];
+
+      for (int j = 0; j < 8; j++) {
+        if (crc & 0x80)
+          crc = (crc << 1) ^ 0x07;
+        else
+          crc <<= 1;
+      }
+    }
+
+    return crc;
   }
 };
 
