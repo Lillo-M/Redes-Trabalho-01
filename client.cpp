@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <bits/stdc++.h>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,9 +29,8 @@ using namespace std;
 #define WAIT_RESPONSE_TIMEOUT_MS 500
 #define POLL_REQUESTS_TIMEOUT 5000
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
-#define PAYLOAD_SIZE 536
-#define SIZE_OF_PACKET (8 + sizeof(TransfererHeader))
-#define RECEIVE_BUFFER_SIZE (1 << 14) * SIZE_OF_PACKET
+#define PAYLOAD_SIZE 1420
+#define RECEIVE_BUFFER_SIZE (1 << 13) * sizeof(TransfererHeader)
 
 enum TransferFlags {
   ACK = (1 << 0),
@@ -138,6 +138,8 @@ void closeSocketAtExit(int status, void *socket) {
 
 class Client {
 public:
+  int lesserCount = 0;
+  bool staleFeedbackSent = false;
   int losePacketChance = 0;
   string ipv4 = "";
   int port = DEFAULT_PORT;
@@ -195,12 +197,12 @@ public:
       timeouts++;
       if (timeouts > 100) {
         cout << "timeout: server stopped responding.\n" << endl;
-        exit(-1);
+        exit(EXIT_FAILURE);
       }
     } while (ret == 0);
   }
 
-  void askRetransmition(uint32_t sequence) {
+  void askRetransmission(uint32_t sequence) {
     std::printf("Asking retransmit of seq %u\n", sequence - 1);
     sendAck(sequence - 1);
   }
@@ -228,7 +230,7 @@ public:
       std::printf("Save as (no input will save the file as `%s`): ",
                   filename.c_str());
       cin >> filenameToSaveAs;
-    } else if (argc == 3 || argc == 4) {
+    } else if (argc >= 3 && argc <= 5) {
       handleApplicationArgs(argv, argc);
     } else {
       argsUsageError();
@@ -269,18 +271,28 @@ public:
     // Receive reply from server
     while (true) {
       TransfererHeader ackPacket;
+      uint32_t timeoutCounter = 0;
+      while (poll(&pfd, POLLIN, 1000) <= 0) {
+        timeoutCounter++;
+        if (timeoutCounter > 3) {
+          cout << "timeout: server stopped responding.\n" << endl;
+          exit(EXIT_FAILURE);
+        }
+      }
       int n = recvfrom(serverSocket, &ackPacket, sizeof(ackPacket), MSG_WAITALL,
                        (struct sockaddr *)&serverAddress, &len);
 
-      if (rand() % 100 < losePacketChance)
+      if (rand() % 1000 < losePacketChance)
         continue;
 
       if (ackPacket.sequence == sequence && ackPacket.flags != ERROR) {
+        lesserCount = 0;
+        staleFeedbackSent = false;
 
         if (ackPacket.checksum !=
             calculateChecksum(ackPacket.data, ackPacket.dataSize)) {
           if (sequence > 0) {
-            askRetransmition(sequence);
+            askRetransmission(sequence);
           }
           continue;
         }
@@ -313,7 +325,7 @@ public:
         } else if (ackPacket.flags & (FIN | DATA)) {
           if (ackPacket.checksum !=
               calculateChecksum(ackPacket.data, ackPacket.dataSize)) {
-            askRetransmition(sequence);
+            askRetransmission(sequence);
             continue;
           }
           fileWriter.closeFile();
@@ -338,19 +350,8 @@ public:
         }
 #endif
 
-        static int lesserCount = 0;
-        if (ackPacket.sequence >= sequence) {
-          lesserCount = 0;
-          discardStalePackets();
-          askRetransmition(sequence);
-        } else {
-          lesserCount++;
-          if (lesserCount >= 3) {
-            lesserCount = 0;
-            discardStalePackets();
-            askRetransmition(sequence);
-          }
-        }
+        discardStalePackets();
+        askRetransmission(sequence);
       } else if (ackPacket.flags == ERROR) {
         cout << "Bad request: ";
         fwrite(ackPacket.data, 1, ackPacket.dataSize, stdout);
@@ -383,7 +384,7 @@ public:
 
       if (i == 100) {
         cout << "timeout: server stopped responding.\n" << endl;
-        exit(-1);
+        exit(EXIT_FAILURE);
       }
     }
 
@@ -397,7 +398,7 @@ public:
 
     if (ret < 0) {
       cout << "timeout: server stopped responding.\n" << endl;
-      exit(-1);
+      exit(EXIT_FAILURE);
     }
 
     receiveFinAck(header);
@@ -471,9 +472,12 @@ public:
   }
 
   void argsUsageError() {
-    cout << "usage: ./client <ipv4>:<port> <file_path> <save_as>\n"
-            "save_as (optional): Is the directory/name to save the file in the "
-            "client machine\n";
+    cout
+        << "usage: ./client <ipv4>:<port> <file_path> <save_as> "
+           "<test_packet_loss>\n"
+           "save_as (optional): Is the directory/name to save the file in the "
+           "client machine\n"
+           "test_packet_loss is the amount per 1000 of packets to be dropped\n";
     exit(EXIT_FAILURE);
   }
 
@@ -499,7 +503,13 @@ public:
 
     filename = arguments[2];
 
-    filenameToSaveAs = length == 4 ? arguments[3] : filename;
+    filenameToSaveAs = length >= 4 ? arguments[3] : filename;
+
+    if (length >= 5) {
+      losePacketChance = atoi(arguments[4]);
+      printf("Losing packets for testing enabled: %.1f %%\n",
+             ((float)losePacketChance) / 10.f);
+    }
 
     cout << "ipv4: " << ipv4 << "\nport: " << port << "\nfilename: " << filename
          << "\ndownloading as: " << filenameToSaveAs << endl;
@@ -587,7 +597,7 @@ public:
   }
 
   void sockSend(TransfererHeader &data) {
-    if (rand() % 100 < losePacketChance)
+    if (rand() % 1000 < losePacketChance)
       return;
     sendto(serverSocket, &data, sizeof(data), 0,
            (struct sockaddr *)&serverAddress, sizeof(serverAddress));
@@ -608,6 +618,7 @@ public:
     pfd.events = POLLIN;
   }
 
+  // https://stackoverflow.com/questions/51752284/how-to-calculate-crc8-in-c
   uint8_t calculateChecksum(char *data, int size) {
     uint8_t crc = 0x00;
 

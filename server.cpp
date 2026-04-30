@@ -45,7 +45,7 @@ using namespace std::chrono;
 #define POLL_REQUESTS_TIMEOUT 5000
 #define WAIT_RESPONSE_TIMEOUT_MS 50
 #define INIT_ESTIMATED_TIMEOUT CLOCKS_PER_SEC / 2
-#define PAYLOAD_SIZE 536
+#define PAYLOAD_SIZE 1420
 
 #define WINDOW_SIZE ((unsigned int)(1 << 14))
 
@@ -120,6 +120,8 @@ public:
   steady_clock::time_point rttBegin = steady_clock::now();
   uint32_t measuringSeq = -1;
   bool measuring = false;
+  uint32_t lastAck = UINT32_MAX;
+  int ackDupCount = 0;
 
   Server() {
     if (!instance) {
@@ -128,8 +130,6 @@ public:
 
     signal(SIGALRM, Server::timeoutHandler);
     signal(SIGCHLD, Server::sigChildHandler);
-
-    inputIpAddress();
 
     // creating socket
     serverSocket = socket(AF_INET, SOCK_DGRAM,
@@ -338,6 +338,7 @@ public:
     return bytesRead;
   }
 
+  // https://stackoverflow.com/questions/51752284/how-to-calculate-crc8-in-c
   uint8_t calculateChecksum(uint8_t *data, int size) {
     uint8_t crc = 0x00;
 
@@ -778,7 +779,7 @@ public:
     if (sampleRTT == 0) {
       if (hasTimedOut) {
         lastTimeoutLen *= 2;
-        lastTimeoutLen = lastTimeoutLen > 500 ? 500 : lastTimeoutLen;
+        lastTimeoutLen = lastTimeoutLen > 1000 ? 1000 : lastTimeoutLen;
       }
       setTimer(lastTimeoutLen * 1000);
       startTimer();
@@ -816,8 +817,9 @@ public:
       break;
     }
 
-    if (!nackedPacketsBuffer.empty() &&
-        header.ackNumber + 1 > sequenceNumber) {
+    printf("Acknowledge Received %d\n", header.ackNumber);
+
+    if (!nackedPacketsBuffer.empty() && header.ackNumber + 1 > sequenceNumber) {
 
       resetNackedWindow(header.ackNumber);
       discardPackets(); // drain stales from this wrong window
@@ -849,9 +851,6 @@ public:
 
     int ret = poll(&pfd, 1, TIMEOUT_MS);
 
-    static uint32_t lastAck = UINT32_MAX;
-    static int AckDupCount = 0;
-
     if (nackedPacketsCount <= 0)
       return;
 
@@ -859,6 +858,27 @@ public:
       ret = poll(&pfd, 1, TIMEOUT_MS);
       if (tOut) {
         tOut = false;
+
+        // Drena ACKs pendentes para saber até onde o cliente realmente chegou
+        TransfererHeader ack;
+        while (poll(&pfd, 1, 0) > 0) {
+          sockReceive(ack);
+          if (ack.flags & ACK) {
+            // Remove pacotes já confirmados da janela
+            while (!nackedPacketsBuffer.empty() &&
+                   nackedPacketsBuffer.front().sequence <= ack.sequence) {
+              nackedPacketsBuffer.pop_front();
+              nackedPacketsCount--;
+            }
+          }
+        }
+
+        // Agora reseta a partir do estado real (atualizado pelos ACKs acima)
+        if (nackedPacketsCount > 0) {
+          resetNackedWindow(sequenceNumber - nackedPacketsCount);
+        }
+
+        setTimeout(0, true);
         return;
       }
     }
@@ -866,6 +886,8 @@ public:
     while (ret > 0) {
       sockReceive(header);
       ret = poll(&pfd, 1, TIMEOUT_MS);
+
+      printf("Polled ack %d\n", header.ackNumber);
 
       if (tOut) {
         tOut = false;
@@ -886,35 +908,37 @@ public:
 
         // Agora reseta a partir do estado real (atualizado pelos ACKs acima)
         if (nackedPacketsCount > 0) {
-          resetNackedWindow(sequenceNumber - nackedPacketsCount - 1);
+          resetNackedWindow(sequenceNumber - nackedPacketsCount);
         }
 
         setTimeout(0, true);
         return;
       }
+
       if (header.flags & TransferFlags::ACK) {
         if (!nackedPacketsBuffer.empty() &&
             header.ackNumber + 1 < nackedPacketsBuffer.front().sequence) {
           continue;
         }
 
+        if (!nackedPacketsBuffer.empty() &&
+            header.ackNumber > nackedPacketsBuffer.back().sequence) {
 
-    if (!nackedPacketsBuffer.empty() &&
-        header.ackNumber + 1 > sequenceNumber) {
-
-      resetNackedWindow(header.ackNumber);
-      discardPackets(); // drain stales from this wrong window
-      return;
-    }
+          resetNackedWindow(header.ackNumber);
+          discardPackets();
+          ackDupCount = 0;
+          lastAck = UINT32_MAX;
+          return;
+        }
 
         if ((nackedPacketsBuffer.empty() ||
              header.ackNumber + 1 == nackedPacketsBuffer.front().sequence) &&
             lastAck == header.ackNumber) {
-          AckDupCount++;
+          ackDupCount++;
 
-          if (AckDupCount >= 3) {
+          if (ackDupCount >= 3) {
             tripleAcks(header.ackNumber, header.flags);
-            AckDupCount = 0;
+            ackDupCount = 0;
             lastAck = UINT32_MAX;
             return;
           }
@@ -924,7 +948,7 @@ public:
           continue;
         }
 
-        AckDupCount = 0;
+        ackDupCount = 0;
         lastAck = header.ackNumber;
         acknowledgePacket(header);
       }
@@ -954,15 +978,39 @@ public:
       state = FastRecovery;
       break;
     case FastRecovery:
-      setCwnd(cwnd + 1);
+      // setCwnd(cwnd + 1);
       fastRecover(ackNumber);
       break;
     }
 
+    setTimeout();
+    while (!tOut)
+      sleep_for(milliseconds(10));
+    tOut = false;
+    setTimeout();
+
     if (flags & SR) {
       sockSend(nackedPacketsBuffer.front());
     } else {
-      resetNackedWindow(ackNumber);
+      while (poll(&pfd, 1, 0) > 0) {
+        TransfererHeader ack;
+        sockReceive(ack);
+        if (ack.flags & ACK) {
+          // Remove pacotes já confirmados da janela
+          while (!nackedPacketsBuffer.empty() &&
+                 nackedPacketsBuffer.front().sequence <= ack.sequence) {
+            nackedPacketsBuffer.pop_front();
+            nackedPacketsCount--;
+          }
+        }
+        if (ackNumber < ack.ackNumber)
+          ackNumber = ack.ackNumber;
+      }
+
+      // Agora reseta a partir do estado real (atualizado pelos ACKs acima)
+      if (nackedPacketsCount > 0) {
+        resetNackedWindow(ackNumber + 1);
+      }
     }
   }
 
@@ -974,7 +1022,7 @@ public:
 
   void timedOut() {
     if (nackedPacketsCount > 0) {
-      resetNackedWindow(sequenceNumber - nackedPacketsCount - 1);
+      resetNackedWindow(sequenceNumber - nackedPacketsCount);
     }
     tOut = true;
     setTimeout(0, true);
@@ -1033,6 +1081,8 @@ public:
       packet = createPacket(buffer, bytesRead, sequence, DATA);
       sendPacket(packet);
 
+      printf("Sent seq: %d \n", sequence);
+
       measureRTT(sequence);
 
       sequence++;
@@ -1043,11 +1093,13 @@ public:
 
   void resetNackedWindow(uint32_t ackNumber) {
     nackedPacketsBuffer.clear();
+    nackedPacketsCount = 0;
 
     sequenceNumber = ackNumber;
 
-    while ((uint32_t)(sequenceNumber * PAYLOAD_SIZE) >= fileSize) {
-      sequenceNumber--;
+    if ((uint32_t)(sequenceNumber * PAYLOAD_SIZE) >= fileSize) {
+      fileRemaining = 0;
+      return;
     }
 
     file.clear();
@@ -1058,8 +1110,6 @@ public:
       cout << "Failed: " << file.fail() << endl;
       sleep_for(milliseconds(5000));
     }
-
-    nackedPacketsCount = 0;
   }
 
   int sequenceNumber = 0;
